@@ -1,13 +1,11 @@
 // ClaudeBar — macOS Touch Bar monitor for Claude Code
-// Shows: current model, today's token usage, DeepSeek balance, active/idle status
-//        dynamic option buttons for yes/no prompts
+// Shows: current model, today's token usage, DeepSeek balance
 
 #import <Cocoa/Cocoa.h>
 #import <CoreServices/CoreServices.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <dlfcn.h>
 #import <objc/message.h>
-#import <objc/runtime.h>
 
 // ============================================================
 // DFRFoundation private API (pins Touch Bar to Control Strip)
@@ -40,15 +38,6 @@ static const double kPriceProOutput     = 6.0;
 static const double kPriceProCacheHit   = 0.025;
 
 // ============================================================
-// Touch Bar item identifiers
-// ============================================================
-static NSTouchBarItemIdentifier const kTrayItem    = @"com.claude.tray";
-static NSTouchBarItemIdentifier const kModelItem   = @"com.claude.model";
-static NSTouchBarItemIdentifier const kStatItem    = @"com.claude.stats";
-static NSTouchBarItemIdentifier const kStatusItem  = @"com.claude.status";
-static NSTouchBarItemIdentifier const kOptionsItem = @"com.claude.options";
-
-// ============================================================
 // DataFetcher — reads Claude Code config & session files,
 //              calls DeepSeek balance API
 // ============================================================
@@ -64,14 +53,11 @@ typedef struct {
 - (NSString *)fetchModel;
 - (NSString *)fetchAPIKey;
 - (TokenUsage)fetchTodayUsage;
-/// Per-model usage: modelName -> @{@"input":NSNumber, @"output":NSNumber, @"cacheRead":NSNumber, @"cacheCreate":NSNumber}
+/// Per-model usage: modelName → @{@"input":NSNumber, @"output":NSNumber, @"cacheRead":NSNumber, @"cacheCreate":NSNumber}
 - (NSDictionary *)fetchTodayUsageByModel;
 /// Cost summed across all models using each model's pricing
 - (double)computeTotalCostWithModelUsage:(NSDictionary *)modelUsage;
 - (void)fetchBalanceWithForce:(BOOL)force completion:(void(^)(double))completion;
-- (BOOL)isClaudeActive;
-- (NSArray *)fetchTouchBarOptions;
-- (void)clearTouchBarOptions;
 @end
 
 @implementation DataFetcher {
@@ -159,7 +145,7 @@ typedef struct {
 - (NSDictionary *)fetchTodayUsageByModel {
     NSString *today = [_df stringFromDate:[NSDate date]];
     NSFileManager *fm = NSFileManager.defaultManager;
-    // model -> @{@"input":NSNumber, @"output":NSNumber, ...}
+    // model → @{@"input":NSNumber, @"output":NSNumber, ...}
     NSMutableDictionary *byModel = [NSMutableDictionary dictionary];
 
     NSArray *projectDirs = [fm contentsOfDirectoryAtPath:_projectsPath error:nil];
@@ -297,55 +283,6 @@ typedef struct {
     }] resume];
 }
 
-// -----------------------------------------------------------
-// Active detection: TRUE if any JSONL was modified in last 60s
-// -----------------------------------------------------------
-- (BOOL)isClaudeActive {
-    NSFileManager *fm = NSFileManager.defaultManager;
-    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
-    NSTimeInterval threshold = 60.0;
-
-    NSArray *projectDirs = [fm contentsOfDirectoryAtPath:_projectsPath error:nil];
-    for (NSString *dir in projectDirs) {
-        NSString *dirPath = [_projectsPath stringByAppendingPathComponent:dir];
-        BOOL isDir = NO;
-        if (![fm fileExistsAtPath:dirPath isDirectory:&isDir] || !isDir) continue;
-
-        NSArray *files = [fm contentsOfDirectoryAtPath:dirPath error:nil];
-        for (NSString *file in files) {
-            if (![file hasSuffix:@".jsonl"]) continue;
-            NSDictionary *attrs = [fm attributesOfItemAtPath:[dirPath stringByAppendingPathComponent:file]
-                                                       error:nil];
-            NSDate *modDate = attrs[NSFileModificationDate];
-            if (modDate && (now - modDate.timeIntervalSince1970) < threshold) {
-                return YES;
-            }
-        }
-    }
-    return NO;
-}
-
-// -----------------------------------------------------------
-// Touch Bar options: read from ~/.claude/.touchbar_options.json
-// -----------------------------------------------------------
-- (NSArray *)fetchTouchBarOptions {
-    NSString *path = [@"~/.claude/.touchbar_options.json" stringByExpandingTildeInPath];
-    NSData *data = [NSData dataWithContentsOfFile:path];
-    if (!data) return nil;
-    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-    if ([obj isKindOfClass:NSArray.class]) return obj;
-    if ([obj isKindOfClass:NSDictionary.class]) {
-        NSArray *opts = obj[@"options"];
-        if ([opts isKindOfClass:NSArray.class]) return opts;
-    }
-    return nil;
-}
-
-- (void)clearTouchBarOptions {
-    NSString *path = [@"~/.claude/.touchbar_options.json" stringByExpandingTildeInPath];
-    [NSFileManager.defaultManager removeItemAtPath:path error:nil];
-}
-
 @end
 
 // ============================================================
@@ -359,22 +296,20 @@ typedef struct {
 // TouchBarController — manages NSTouchBar + Control Strip
 // ============================================================
 
+static NSTouchBarItemIdentifier const kTrayItem  = @"com.claude.tray";
+static NSTouchBarItemIdentifier const kModelItem = @"com.claude.model";
+static NSTouchBarItemIdentifier const kStatItem  = @"com.claude.stats";
+
 @interface TouchBarController : NSObject <NSTouchBarDelegate>
 @property (nonatomic, strong) NSTextField *modelLabel;
 @property (nonatomic, strong) NSTextField *tokensLabel;
 @property (nonatomic, strong) NSTextField *costLabel;
 @property (nonatomic, strong) NSTextField *cacheLabel;
 @property (nonatomic, strong) NSTextField *balanceLabel;
-@property (nonatomic, strong) NSTextField *statusDot;
-@property (nonatomic, strong) NSStackView *optionsStackView;
-@property (nonatomic, copy) void (^onOptionSelected)(NSString *key);
 @property (readonly) NSTouchBar *claudeBar;
 - (void)setup;
 - (void)updateWithModel:(NSString *)model tokens:(NSInteger)tokens
                     cost:(double)cost cacheRate:(double)cacheRate balance:(double)balance;
-- (void)updateStatus:(BOOL)active;
-- (void)updateOptions:(NSArray *)options;
-- (void)clearOptions;
 @end
 
 @implementation TouchBarController {
@@ -407,23 +342,10 @@ typedef struct {
     _balanceLabel.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
     _balanceLabel.textColor = NSColor.labelColor;
 
-    // ----- Status dot (green/gray circle) -----
-    _statusDot = [NSTextField labelWithString:@"○"];
-    _statusDot.font = [NSFont systemFontOfSize:16 weight:NSFontWeightMedium];
-    _statusDot.textColor = NSColor.systemGrayColor;
-    _statusDot.alignment = NSTextAlignmentCenter;
-
-    // ----- Options stack view (hidden by default) -----
-    _optionsStackView = [NSStackView stackViewWithViews:@[]];
-    _optionsStackView.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    _optionsStackView.spacing = 8;
-    _optionsStackView.hidden = YES;
-
     // ----- Touch Bar -----
     _bar = [[NSTouchBar alloc] init];
     _bar.delegate = self;
-    _bar.defaultItemIdentifiers = @[kStatusItem, kModelItem, kOptionsItem,
-                                     NSTouchBarItemIdentifierFlexibleSpace, kStatItem];
+    _bar.defaultItemIdentifiers = @[kModelItem, kStatItem, NSTouchBarItemIdentifierFlexibleSpace];
     _bar.customizationIdentifier = @"com.claude.bar";
 
     // NSPanel with NonactivatingPanel — becomes key for Touch Bar without stealing focus
@@ -445,15 +367,12 @@ typedef struct {
     NSView *cv = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 500, 44)];
     cv.wantsLayer = YES;
     cv.layer.cornerRadius = 8;
-    _statusDot.frame     = NSMakeRect(2,  10, 16, 24);
-    _modelLabel.frame    = NSMakeRect(20, 12, 180, 20);
-    _tokensLabel.frame   = NSMakeRect(215, 26, 130, 16);
-    _costLabel.frame     = NSMakeRect(215, 6,  130, 16);
-    _cacheLabel.frame    = NSMakeRect(345, 26, 130, 16);
-    _balanceLabel.frame  = NSMakeRect(345, 6,  145, 16);
-    _optionsStackView.frame = NSMakeRect(210, 10, 80, 24);
-    for (NSView *v in @[_statusDot, _modelLabel, _tokensLabel, _costLabel,
-                         _cacheLabel, _balanceLabel, _optionsStackView]) {
+    _modelLabel.frame   = NSMakeRect(12, 12, 190, 20);
+    _tokensLabel.frame  = NSMakeRect(215, 26, 130, 16);
+    _costLabel.frame    = NSMakeRect(215, 6,  130, 16);
+    _cacheLabel.frame   = NSMakeRect(345, 26, 130, 16);
+    _balanceLabel.frame = NSMakeRect(345, 6,  145, 16);
+    for (NSView *v in @[_modelLabel, _tokensLabel, _costLabel, _cacheLabel, _balanceLabel]) {
         [cv addSubview:v];
     }
     _tbWindow.contentView = cv;
@@ -497,69 +416,12 @@ typedef struct {
     _balanceLabel.stringValue = [NSString stringWithFormat:@"Balance: ¥%.2f", balance];
 }
 
-- (void)updateStatus:(BOOL)active {
-    _statusDot.stringValue = active ? @"●" : @"○";
-    _statusDot.textColor   = active ? [NSColor systemGreenColor] : [NSColor systemGrayColor];
-}
-
-- (void)updateOptions:(NSArray *)options {
-    // Remove existing buttons
-    for (NSView *v in _optionsStackView.views) {
-        [_optionsStackView removeView:v];
-    }
-
-    if (!options || options.count == 0) {
-        _optionsStackView.hidden = YES;
-        return;
-    }
-
-    for (NSDictionary *opt in options) {
-        NSString *label = opt[@"label"];
-        NSString *key   = opt[@"key"];
-        if (!label || !key) continue;
-
-        NSButton *btn = [NSButton buttonWithTitle:label target:self action:@selector(optionButtonTapped:)];
-        btn.bezelStyle = NSBezelStyleRounded;
-        objc_setAssociatedObject(btn, @selector(optionButtonTapped:), key, OBJC_ASSOCIATION_COPY_NONATOMIC);
-        btn.contentTintColor = NSColor.labelColor;
-
-        [_optionsStackView addView:btn inGravity:NSStackViewGravityLeading];
-    }
-
-    _optionsStackView.hidden = NO;
-}
-
-- (void)clearOptions {
-    _optionsStackView.hidden = YES;
-    for (NSView *v in _optionsStackView.views) {
-        [_optionsStackView removeView:v];
-    }
-}
-
-- (void)optionButtonTapped:(NSButton *)sender {
-    NSString *key = objc_getAssociatedObject(sender, _cmd);
-    if (self.onOptionSelected && key) {
-        self.onOptionSelected(key);
-    }
-    [self clearOptions];
-}
-
 #pragma mark - NSTouchBarDelegate
 
 - (NSTouchBarItem *)touchBar:(NSTouchBar *)bar makeItemForIdentifier:(NSTouchBarItemIdentifier)ident {
-    if ([ident isEqual:kStatusItem]) {
-        NSCustomTouchBarItem *item = [[NSCustomTouchBarItem alloc] initWithIdentifier:ident];
-        item.view = _statusDot;
-        return item;
-    }
     if ([ident isEqual:kModelItem]) {
         NSCustomTouchBarItem *item = [[NSCustomTouchBarItem alloc] initWithIdentifier:ident];
         item.view = _modelLabel;
-        return item;
-    }
-    if ([ident isEqual:kOptionsItem]) {
-        NSCustomTouchBarItem *item = [[NSCustomTouchBarItem alloc] initWithIdentifier:ident];
-        item.view = _optionsStackView;
         return item;
     }
     if ([ident isEqual:kStatItem]) {
@@ -609,17 +471,9 @@ static NSString *resolveDesktopModel(NSString *desktopModel);
 - (void)updateDesktopModel:(NSString *)model;
 @end
 
-// -----------------------------------------------------------
-// Monotonic clock helper (no extra framework needed)
-// -----------------------------------------------------------
-static double monotonicSeconds(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
-}
-
-// Key event tracking for auto-dismiss on typing
-// Uses CGEventSource + burst detection heuristic (no permissions needed)
+// Key event tracking for auto-dismiss on typing - IOKit HID monitoring
+// (No accessibility permissions needed)
+// Uses CGEventSourceSecondsSinceLastKeyPress - no permissions needed
 
 @implementation AppDelegate {
     NSString           *_lastModel;
@@ -628,30 +482,17 @@ static double monotonicSeconds(void) {
     double              _lastCost;
     double              _lastCacheRate;
     double              _lastBalance;
-    BOOL                _isActive;
     FSEventStreamRef    _fsStream;
     NSTimer            *_refreshTimer;
     NSTimer            *_typingTimer;
     BOOL                _pinned;
     BOOL                _dismissedForTyping;
     NSMenuItem         *_pinMenuItem;
-    int                 _keyBurstCount;
-    double              _keyBurstStart;
-    double              _lastKeyEventTime;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)note {
     _fetcher  = [[DataFetcher alloc] init];
     _touchBar = [[TouchBarController alloc] init];
-
-    // --- Touch Bar option callback ---
-    __weak typeof(self) weakSelf = self;
-    _touchBar.onOptionSelected = ^(NSString *key) {
-        __strong typeof(weakSelf) self = weakSelf;
-        if (!self) return;
-        [self sendKeystroke:key];
-        [self.fetcher clearTouchBarOptions];
-    };
 
     // --- Menu bar ---
     _statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
@@ -659,12 +500,11 @@ static double monotonicSeconds(void) {
 
     NSMenu *menu = [[NSMenu alloc] init];
     menu.delegate = self;
-    [menu addItemWithTitle:@"Claude …" action:nil keyEquivalent:@""];               // 0: status
-    [menu addItemWithTitle:@"Model: …" action:nil keyEquivalent:@""];                // 1: model
-    [menu addItemWithTitle:@"Today: …" action:nil keyEquivalent:@""];                // 2: tokens
-    [menu addItemWithTitle:@"Cost: …" action:nil keyEquivalent:@""];                 // 3: cost
-    [menu addItemWithTitle:@"Balance: …" action:nil keyEquivalent:@""];              // 4: balance
-    [menu addItem:NSMenuItem.separatorItem];                                         // 5: sep
+    [menu addItemWithTitle:@"Model: …" action:nil keyEquivalent:@""];
+    [menu addItemWithTitle:@"Today: …" action:nil keyEquivalent:@""];
+    [menu addItemWithTitle:@"Cost: …" action:nil keyEquivalent:@""];
+    [menu addItemWithTitle:@"Balance: …" action:nil keyEquivalent:@""];
+    [menu addItem:NSMenuItem.separatorItem];
 
     NSMenuItem *refreshItem = [menu addItemWithTitle:@"Refresh Now" action:@selector(refreshNow) keyEquivalent:@""];
     refreshItem.target = self;
@@ -711,47 +551,19 @@ static double monotonicSeconds(void) {
 
 
 
-    // --- Typing detection: key-burst heuristic ---
-    // Uses CGEventSource + event frequency analysis (no permissions needed)
-    // Dismisses Touch Bar only during rapid key presses (3+ in 1.5s = typing)
-    // Single presses (Enter, arrows) are ignored
-    _keyBurstCount = 0;
-    _keyBurstStart = monotonicSeconds();
-    _lastKeyEventTime = monotonicSeconds();
-
-    _typingTimer = [NSTimer scheduledTimerWithTimeInterval:0.12 repeats:YES block:^(NSTimer *t) {
+    // Poll every 1s: check time since last key press
+    // CGEventSourceSecondsSinceLastKeyPress returns 0-999 sec since any keyboard activity
+    _typingTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
         if (!_pinned) return;
-
         double elapsed = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState, kCGEventKeyDown);
-        double now = monotonicSeconds();
-
-        // Detect new key events by checking if elapsed is very small
-        // and we haven't already counted this event
-        if (elapsed < 0.1 && (now - _lastKeyEventTime) > 0.08) {
-            _keyBurstCount++;
-            _lastKeyEventTime = now;
-
-            // Reset burst window every 1.5s
-            if (now - _keyBurstStart > 1.5) {
-                _keyBurstStart = now;
-                _keyBurstCount = 1;
-            }
-        }
-
-        // Dismiss on sustained typing (3+ events in 1.5s window)
-        if (_keyBurstCount >= 3 && !_dismissedForTyping) {
+        if (elapsed < 2.0 && !_dismissedForTyping) {
             SEL sel = NSSelectorFromString(@"dismissSystemModalTouchBar:");
             if ([NSTouchBar respondsToSelector:sel])
                 ((void(*)(id, SEL, id))objc_msgSend)([NSTouchBar class], sel, _touchBar.claudeBar);
             _dismissedForTyping = YES;
-        }
-
-        // Re-show after 5s of no key events
-        double idleTime = now - _lastKeyEventTime;
-        if (idleTime > 5.0 && _dismissedForTyping) {
+        } else if (elapsed > 5.0 && _dismissedForTyping) {
             [self presentTouchBarModal];
             _dismissedForTyping = NO;
-            _keyBurstCount = 0;
         }
     }];
 
@@ -765,16 +577,6 @@ static double monotonicSeconds(void) {
 }
 
 - (void)refreshWithForceBalance:(BOOL)force {
-    // Active status
-    _isActive = [_fetcher isClaudeActive];
-    [_touchBar updateStatus:_isActive];
-
-    // Options from file
-    NSArray *options = [_fetcher fetchTouchBarOptions];
-    if (options) {
-        [_touchBar updateOptions:options];
-    }
-
     // Prefer Claude Code model from settings.json, fallback to Desktop App model
     _lastModel   = [_fetcher fetchModel];
     if (!_lastModel || [_lastModel isEqualToString:@"Unknown"]) {
@@ -814,19 +616,17 @@ static double monotonicSeconds(void) {
 
     _statusItem.button.title = [NSString stringWithFormat:@"CC %@", tks];
 
-    [_statusItem.menu itemAtIndex:0].title = [NSString stringWithFormat:
-        @"%@ Claude %@", _isActive ? @"●" : @"○", _isActive ? @"Active" : @"Idle"];
-    [_statusItem.menu itemAtIndex:1].title = [NSString stringWithFormat:@"Model: %@", _lastModel];
-    [_statusItem.menu itemAtIndex:2].title = [NSString stringWithFormat:
+    [_statusItem.menu itemAtIndex:0].title = [NSString stringWithFormat:@"Model: %@", _lastModel];
+    [_statusItem.menu itemAtIndex:1].title = [NSString stringWithFormat:
         @"Today: %@ tokens  (in %@ | out %@ | cache +%@)",
         tks,
         [self formatNumber:_lastUsage.input],
         [self formatNumber:_lastUsage.output],
         [self formatNumber:_lastUsage.cacheRead + _lastUsage.cacheCreate]];
-    [_statusItem.menu itemAtIndex:3].title = [NSString stringWithFormat:
+    [_statusItem.menu itemAtIndex:2].title = [NSString stringWithFormat:
         @"Cost: ¥%.2f  |  Cache hit: %.0f%% (%@ read)", _lastCost, _lastCacheRate,
         [self formatNumber:_lastUsage.cacheRead]];
-    [_statusItem.menu itemAtIndex:4].title = [NSString stringWithFormat:@"Balance: ¥%.2f", _lastBalance];
+    [_statusItem.menu itemAtIndex:3].title = [NSString stringWithFormat:@"Balance: ¥%.2f", _lastBalance];
 
     [_touchBar updateWithModel:_lastModel tokens:totalTokens
                           cost:_lastCost cacheRate:_lastCacheRate balance:_lastBalance];
@@ -893,69 +693,6 @@ static double monotonicSeconds(void) {
 
 - (void)quitApp { [NSApp terminate:nil]; }
 
-// -----------------------------------------------------------
-// Send keystroke to the frontmost application
-// -----------------------------------------------------------
-- (void)sendKeystroke:(NSString *)key {
-    if (key.length == 0) return;
-
-    unichar c = [key characterAtIndex:0];
-    CGKeyCode code = [self keyCodeForChar:c];
-    if (code == 0xFF) return;
-
-    CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
-
-    // Key down
-    CGEventRef down = CGEventCreateKeyboardEvent(source, code, YES);
-    CGEventPost(kCGSessionEventTap, down);
-    CFRelease(down);
-
-    // Key up
-    CGEventRef up = CGEventCreateKeyboardEvent(source, code, NO);
-    CGEventPost(kCGSessionEventTap, up);
-    CFRelease(up);
-
-    // Follow with Return to confirm the choice
-    CGEventRef retDown = CGEventCreateKeyboardEvent(source, (CGKeyCode)36, YES); // kVK_Return
-    CGEventRef retUp   = CGEventCreateKeyboardEvent(source, (CGKeyCode)36, NO);
-    CGEventPost(kCGSessionEventTap, retDown);
-    CGEventPost(kCGSessionEventTap, retUp);
-    CFRelease(retDown);
-    CFRelease(retUp);
-
-    CFRelease(source);
-
-    // Clear options after selection
-    [_touchBar clearOptions];
-}
-
-- (CGKeyCode)keyCodeForChar:(unichar)c {
-    if (c >= 'a' && c <= 'z') return (CGKeyCode)(c - 'a');           // a=0 … z=25 (QWERTY US)
-    if (c >= 'A' && c <= 'Z') return (CGKeyCode)(c - 'A');
-    if (c >= '0' && c <= '9') {
-        // Standard US key codes for digits
-        const CGKeyCode digits[] = {29, 18, 19, 20, 21, 23, 22, 26, 28, 25};
-        return digits[c - '0'];
-    }
-    switch (c) {
-        case '\r': case '\n': return 36; // Return
-        case ' ':  return 49;            // Space
-        case '\t': return 48;            // Tab
-        case '.':  return 47;
-        case ',':  return 43;
-        case '-':  return 27;
-        case '=':  return 24;
-        case '[':  return 33;
-        case ']':  return 30;
-        case '/':  return 44;
-        case '\\': return 42;
-        case ';':  return 41;
-        case '\'': return 39;
-        case '`':  return 50;
-    }
-    return 0xFF; // unknown
-}
-
 - (void)dealloc {
     [_refreshTimer invalidate];
     [_typingTimer invalidate];
@@ -971,7 +708,6 @@ static double monotonicSeconds(void) {
 
 // ============================================================
 // FSEvents callback — settings.json changes → instant model update
-//                  — .touchbar_options.json → instant options update
 // ============================================================
 
 static void onClaudeDirChanged(ConstFSEventStreamRef stream, void *info,
@@ -994,14 +730,6 @@ static void onClaudeDirChanged(ConstFSEventStreamRef stream, void *info,
                 NSString *m = desktopModelFromLevelDB();
                 if (m) m = resolveDesktopModel(m);
                 if (m) [delegate updateDesktopModel:m];
-            });
-            return;
-        }
-        // Touch Bar options file changed → update options
-        if ([p hasSuffix:@".touchbar_options.json"]) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                NSArray *opts = [delegate.fetcher fetchTouchBarOptions];
-                [delegate.touchBar updateOptions:opts];
             });
             return;
         }
