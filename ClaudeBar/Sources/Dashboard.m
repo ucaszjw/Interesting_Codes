@@ -46,7 +46,7 @@
         CGFloat y = padB + plotH * i / 4.0;
         [grid moveToPoint:NSMakePoint(padL, y)];
         [grid lineToPoint:NSMakePoint(w - padR, y)];
-        NSString *label = [self shortStr:maxVal * (4 - i) / 4.0];
+        NSString *label = [self shortStr:maxVal * i / 4.0];
         [label drawAtPoint:NSMakePoint(2, y - 6) withAttributes:_attribs];
     }
     [grid stroke];
@@ -123,11 +123,12 @@
     [self showWindow:nil];
 
     NSWindow *win = self.window;
-    NSPoint origin = NSMakePoint(rect.origin.x + rect.size.width - win.frame.size.width + 10,
-                                  rect.origin.y - win.frame.size.height - 5);
+    // Convert button frame to screen coordinates
+    NSRect screenRect = [view.window convertRectToScreen:rect];
+    NSPoint origin = NSMakePoint(NSMidX(screenRect) - win.frame.size.width / 2,
+                                  screenRect.origin.y - win.frame.size.height - 4);
     [win setFrameOrigin:origin];
     [win makeKeyAndOrderFront:nil];
-    [NSApp activateIgnoringOtherApps:YES];
 }
 
 - (void)loadData {
@@ -166,7 +167,7 @@
     _rankingTable.backgroundColor = NSColor.clearColor;
 
     NSTableColumn *nameCol = [[NSTableColumn alloc] initWithIdentifier:@"name"];
-    [nameCol setWidth:180];
+    [nameCol setWidth:200];
     [_rankingTable addTableColumn:nameCol];
 
     NSTableColumn *tokenCol = [[NSTableColumn alloc] initWithIdentifier:@"tokens"];
@@ -197,6 +198,10 @@
     NSTextField *tf = [NSTextField labelWithString:text];
     [tf setFont:[NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular]];
     [tf setTextColor:[key isEqual:@"name"] ? NSColor.labelColor : NSColor.secondaryLabelColor];
+    if ([key isEqual:@"name"]) {
+        [tf setLineBreakMode:NSLineBreakByTruncatingMiddle];
+        [tf setToolTip:text];
+    }
     return tf;
 }
 

@@ -334,13 +334,13 @@ static const double kPriceProCacheHit   = 0.025;
         NSString *dirPath = [_projectsPath stringByAppendingPathComponent:dir];
         BOOL isDir = NO;
         if (![fm fileExistsAtPath:dirPath isDirectory:&isDir] || !isDir) continue;
-        NSInteger totalInp = 0, totalOut = 0;
+        NSInteger totalInp = 0, totalOut = 0, totalCache = 0;
         for (NSString *file in [fm contentsOfDirectoryAtPath:dirPath error:nil]) {
             if (![file hasSuffix:@".jsonl"]) continue;
             [self accumulateProjectTokens:[dirPath stringByAppendingPathComponent:file]
-                                   input:&totalInp output:&totalOut];
+                                   input:&totalInp output:&totalOut cache:&totalCache];
         }
-        NSInteger totalTokens = totalInp + totalOut;
+        NSInteger totalTokens = totalInp + totalOut + totalCache;
         if (totalTokens == 0) continue;
         double cost = (totalInp * 1.0 + totalOut * 2.0) / 1000000.0;
         [ranking addObject:@{@"name": dir, @"tokens": @(totalTokens), @"cost": @(cost)}];
@@ -351,14 +351,14 @@ static const double kPriceProCacheHit   = 0.025;
     return ranking;
 }
 
-- (void)accumulateProjectTokens:(NSString *)path input:(NSInteger *)inp output:(NSInteger *)out {
+- (void)accumulateProjectTokens:(NSString *)path input:(NSInteger *)inp output:(NSInteger *)out cache:(NSInteger *)cache {
     NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
     if (!data) return;
     NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     if (!content) return;
     [content enumerateLinesUsingBlock:^(NSString *line, BOOL *stop) {
-        NSInteger i = -1, o = -1;
-        for (NSString *key in @[@"input_tokens", @"output_tokens"]) {
+        NSInteger i = -1, o = -1, c = -1;
+        for (NSString *key in @[@"input_tokens", @"output_tokens", @"cache_read_input_tokens"]) {
             NSRange r = [line rangeOfString:[NSString stringWithFormat:@"\"%@\":", key]];
             if (r.location == NSNotFound) continue;
             NSScanner *sc = [NSScanner scannerWithString:[line substringFromIndex:r.location + r.length]];
@@ -366,9 +366,10 @@ static const double kPriceProCacheHit   = 0.025;
             if ([sc scanInteger:&n] && n >= 0) {
                 if ([key isEqual:@"input_tokens"]) i = n;
                 else if ([key isEqual:@"output_tokens"]) o = n;
+                else if ([key isEqual:@"cache_read_input_tokens"]) c = n;
             }
         }
-        if (i >= 0 && o >= 0) { *inp += i; *out += o; }
+        if (i >= 0 && o >= 0) { *inp += i; *out += o; if (c > 0) *cache += c; }
     }];
 }
 @end
@@ -576,6 +577,7 @@ static NSString *resolveDesktopModel(NSString *desktopModel);
     BOOL                _pinned;
     BOOL                _dismissedForTyping;
     NSMenuItem         *_pinMenuItem;
+    DashboardController *_dashboard;
     int                 _keyBurstCount;
     double              _keyBurstStart;
     double              _lastKeyEventTime;
@@ -584,6 +586,7 @@ static NSString *resolveDesktopModel(NSString *desktopModel);
 - (void)applicationDidFinishLaunching:(NSNotification *)note {
     _fetcher  = [[DataFetcher alloc] init];
     _touchBar = [[TouchBarController alloc] init];
+    _dashboard = [[DashboardController alloc] initWithDataFetcher:_fetcher];
 
     // --- Menu bar ---
     _statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
@@ -599,6 +602,10 @@ static NSString *resolveDesktopModel(NSString *desktopModel);
 
     NSMenuItem *refreshItem = [menu addItemWithTitle:@"Refresh Now" action:@selector(refreshNow) keyEquivalent:@""];
     refreshItem.target = self;
+
+    [menu addItem:NSMenuItem.separatorItem];
+    NSMenuItem *dashboardItem = [menu addItemWithTitle:@"Show Dashboard…" action:@selector(showDashboard) keyEquivalent:@"d"];
+    dashboardItem.target = self;
 
     _pinned = YES;
     _pinMenuItem = [menu addItemWithTitle:@"▸ Pin on Touch Bar" action:@selector(togglePinTouchBar) keyEquivalent:@""];
@@ -771,6 +778,12 @@ static NSString *resolveDesktopModel(NSString *desktopModel);
         _lastCost = [_fetcher computeTotalCostWithModelUsage:_lastUsageByModel];
     }
     [self refreshUI];
+}
+
+- (void)showDashboard {
+    [_dashboard showRelativeToRect:_statusItem.button.bounds ofView:_statusItem.button];
+    // Re-present Touch Bar after dashboard opens (may steal key window)
+    [self presentTouchBarModal];
 }
 
 - (void)refreshNow {
