@@ -488,6 +488,9 @@ static NSString *resolveDesktopModel(NSString *desktopModel);
     BOOL                _pinned;
     BOOL                _dismissedForTyping;
     NSMenuItem         *_pinMenuItem;
+    int                 _keyBurstCount;
+    double              _keyBurstStart;
+    double              _lastKeyEventTime;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)note {
@@ -551,19 +554,42 @@ static NSString *resolveDesktopModel(NSString *desktopModel);
 
 
 
-    // Poll every 1s: check time since last key press
-    // CGEventSourceSecondsSinceLastKeyPress returns 0-999 sec since any keyboard activity
-    _typingTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
+    // Poll at 120ms: detect typing bursts (3+ key events in 1.5s)
+    // Single presses (Enter, arrows) don't trigger dismiss
+    _keyBurstCount = 0;
+    _keyBurstStart = [[NSDate date] timeIntervalSince1970];
+    _lastKeyEventTime = [[NSDate date] timeIntervalSince1970];
+
+    _typingTimer = [NSTimer scheduledTimerWithTimeInterval:0.12 repeats:YES block:^(NSTimer *t) {
         if (!_pinned) return;
+
         double elapsed = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState, kCGEventKeyDown);
-        if (elapsed < 2.0 && !_dismissedForTyping) {
+        double now = [[NSDate date] timeIntervalSince1970];
+
+        // Count key events: if a key was pressed since last check
+        if (elapsed < 0.1 && (now - _lastKeyEventTime) > 0.08) {
+            _keyBurstCount++;
+            _lastKeyEventTime = now;
+            if (now - _keyBurstStart > 1.5) {
+                _keyBurstStart = now;
+                _keyBurstCount = 1;
+            }
+        }
+
+        // Dismiss only on sustained typing (3+ events in 1.5s)
+        if (_keyBurstCount >= 3 && !_dismissedForTyping) {
             SEL sel = NSSelectorFromString(@"dismissSystemModalTouchBar:");
             if ([NSTouchBar respondsToSelector:sel])
                 ((void(*)(id, SEL, id))objc_msgSend)([NSTouchBar class], sel, _touchBar.claudeBar);
             _dismissedForTyping = YES;
-        } else if (elapsed > 5.0 && _dismissedForTyping) {
+        }
+
+        // Re-show after 5s idle
+        double idleTime = now - _lastKeyEventTime;
+        if (idleTime > 5.0 && _dismissedForTyping) {
             [self presentTouchBarModal];
             _dismissedForTyping = NO;
+            _keyBurstCount = 0;
         }
     }];
 
