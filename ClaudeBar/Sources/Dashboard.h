@@ -6,4 +6,5 @@
 @interface DashboardController : NSWindowController
 - (instancetype)initWithDataFetcher:(DataFetcher *)fetcher;
 - (void)showRelativeToRect:(NSRect)rect ofView:(NSView *)view;
+@property (nonatomic, copy) void (^onActivate)(void);
 @end

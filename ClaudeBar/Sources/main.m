@@ -372,6 +372,92 @@ static const double kPriceProCacheHit   = 0.025;
         if (i >= 0 && o >= 0) { *inp += i; *out += o; if (c > 0) *cache += c; }
     }];
 }
+
+// -----------------------------------------------------------
+// Combined single-pass fetch for Dashboard: @[dailyTotals, ranking]
+// -----------------------------------------------------------
+- (NSArray *)fetchAllDashboardData {
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"yyyy-MM-dd";
+    NSMutableDictionary *daily = [NSMutableDictionary dictionary];
+    NSMutableArray *projects = [NSMutableArray array];
+
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSArray *projectDirs = [fm contentsOfDirectoryAtPath:_projectsPath error:nil];
+    for (NSString *dir in projectDirs) {
+        NSString *dirPath = [_projectsPath stringByAppendingPathComponent:dir];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:dirPath isDirectory:&isDir] || !isDir) continue;
+
+        __block NSInteger pInp = 0, pOut = 0, pCache = 0;
+        NSDate *cutoff = [NSDate dateWithTimeIntervalSinceNow:-14 * 86400];
+        for (NSString *file in [fm contentsOfDirectoryAtPath:dirPath error:nil]) {
+            if (![file hasSuffix:@".jsonl"]) continue;
+            // Skip files not modified in the last 14 days
+            NSString *fp = [dirPath stringByAppendingPathComponent:file];
+            NSDictionary *attrs = [fm attributesOfItemAtPath:fp error:nil];
+            NSDate *mod = attrs[NSFileModificationDate];
+            if (mod && [mod compare:cutoff] == NSOrderedAscending) continue;
+            NSData *data = [NSData dataWithContentsOfFile:fp options:NSDataReadingMappedIfSafe error:nil];
+            if (!data) continue;
+            NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (!content) continue;
+
+            NSMutableSet *seen = [NSMutableSet set];
+            [content enumerateLinesUsingBlock:^(NSString *line, BOOL *stop) {
+                // Extract date
+                NSRange tr = [line rangeOfString:@"\"timestamp\":\""];
+                if (tr.location == NSNotFound) return;
+                NSString *rest = [line substringFromIndex:tr.location + tr.length];
+                if (rest.length < 10) return;
+                NSString *date = [rest substringToIndex:10];
+
+                // Extract tokens
+                NSInteger inp = -1, out = -1, cache = -1;
+                for (NSString *key in @[@"input_tokens", @"output_tokens", @"cache_read_input_tokens"]) {
+                    NSRange r = [line rangeOfString:[NSString stringWithFormat:@"\"%@\":", key]];
+                    if (r.location == NSNotFound) continue;
+                    NSScanner *sc = [NSScanner scannerWithString:[line substringFromIndex:r.location + r.length]];
+                    NSInteger n = 0;
+                    if ([sc scanInteger:&n] && n >= 0) {
+                        if ([key isEqual:@"input_tokens"]) inp = n;
+                        else if ([key isEqual:@"output_tokens"]) out = n;
+                        else if ([key isEqual:@"cache_read_input_tokens"]) cache = n;
+                    }
+                }
+
+                if (inp < 0 || out < 0) return;
+                // Dedup: same token counts in same file = duplicate record
+                NSString *dk = [NSString stringWithFormat:@"%ld,%ld,%ld", (long)inp, (long)out, (long)cache];
+                if ([seen containsObject:dk]) return;
+                [seen addObject:dk];
+                NSInteger total = inp + out + (cache > 0 ? cache : 0);
+                daily[date] = @([daily[date] integerValue] + total);
+                pInp += inp; pOut += out; if (cache > 0) pCache += cache;
+            }];
+        }
+        NSInteger pTotal = pInp + pOut + pCache;
+        if (pTotal > 0) {
+            double cost = (pInp * 1.0 + pOut * 2.0) / 1000000.0;
+            [projects addObject:@{@"name": dir, @"tokens": @(pTotal), @"cost": @(cost)}];
+        }
+    }
+
+    // Build daily array (last 7 days)
+    NSMutableArray *dailyArr = [NSMutableArray array];
+    for (int i = 6; i >= 0; i--) {
+        NSDate *d = [NSDate dateWithTimeIntervalSinceNow:-i * 86400];
+        NSNumber *v = daily[[df stringFromDate:d]] ?: @0;
+        [dailyArr addObject:v];
+    }
+
+    // Sort ranking by tokens descending
+    [projects sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [b[@"tokens"] compare:a[@"tokens"]];
+    }];
+
+    return @[dailyArr, projects];
+}
 @end
 
 // ============================================================
@@ -587,6 +673,12 @@ static NSString *resolveDesktopModel(NSString *desktopModel);
     _fetcher  = [[DataFetcher alloc] init];
     _touchBar = [[TouchBarController alloc] init];
     _dashboard = [[DashboardController alloc] initWithDataFetcher:_fetcher];
+    __weak typeof(self) ws = self;
+    _dashboard.onActivate = ^{
+        __strong typeof(ws) ss = ws;
+        [ss.touchBar showTouchBar];
+        [ss presentTouchBarModal];
+    };
 
     // --- Menu bar ---
     _statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];

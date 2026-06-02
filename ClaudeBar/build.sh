@@ -10,7 +10,7 @@ clang \
     -fobjc-arc \
     -framework AppKit \
     -framework Foundation \
-    Sources/main.m Sources/Dashboard.m
+    Sources/main.m Sources/Dashboard.m -Wno-unused-command-line-argument
 
 echo "==> Creating $APP_NAME.app bundle…"
 APP_BUNDLE="$APP_NAME.app"

@@ -99,6 +99,12 @@
 }
 @end
 
+// Prevent dashboard from stealing key window (which hides Touch Bar)
+@interface DashboardPanel : NSPanel @end
+@implementation DashboardPanel
+- (BOOL)canBecomeKeyWindow { return NO; }
+@end
+
 // ============================================================
 // DashboardController
 // ============================================================
@@ -118,8 +124,8 @@
 }
 
 - (void)showRelativeToRect:(NSRect)rect ofView:(NSView *)view {
-    [self loadData];
     [self setupWindow];
+    [self loadData];
     [self showWindow:nil];
 
     NSWindow *win = self.window;
@@ -132,18 +138,27 @@
 }
 
 - (void)loadData {
-    _rankingData = [_fetcher fetchProjectRanking];
-    _chartView.dailyTotals = [_fetcher fetchDailyUsageForLastDays:7];
-    [_rankingTable reloadData];
+    DataFetcher *fetcher = _fetcher;
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSArray *data = [fetcher fetchAllDashboardData];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) ss = ws;
+            if (!ss) return;
+            ss->_chartView.dailyTotals = data[0];
+            ss->_rankingData = data[1];
+            [ss->_rankingTable reloadData];
+        });
+    });
 }
 
 - (void)setupWindow {
     if (self.window) return;
 
-    NSWindow *win = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 380, 420)
-                                               styleMask:NSWindowStyleMaskTitled |
-                                                         NSWindowStyleMaskClosable |
-                                                         NSWindowStyleMaskNonactivatingPanel
+    NSWindow *win = [[DashboardPanel alloc] initWithContentRect:NSMakeRect(0, 0, 380, 420)
+                                                       styleMask:NSWindowStyleMaskTitled |
+                                                                 NSWindowStyleMaskClosable |
+                                                                 NSWindowStyleMaskNonactivatingPanel
                                                  backing:NSBackingStoreBuffered defer:NO];
     win.title = @"Claude Code Usage";
     win.level = NSFloatingWindowLevel;

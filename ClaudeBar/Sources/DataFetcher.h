@@ -19,4 +19,5 @@ typedef struct {
 @property (nonatomic, readonly) NSString *projectsPath;
 - (NSArray *)fetchDailyUsageForLastDays:(int)days;
 - (NSArray *)fetchProjectRanking;
+- (NSArray *)fetchAllDashboardData;  // @[@[dailyTotals], @[ranking]]
 @end
