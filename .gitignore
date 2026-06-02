@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+
+# Build artifacts
+*.o
+*.app
+.build/
