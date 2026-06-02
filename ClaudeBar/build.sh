@@ -10,7 +10,7 @@ clang \
     -fobjc-arc \
     -framework AppKit \
     -framework Foundation \
-    Sources/main.m
+    Sources/main.m Sources/Dashboard.m
 
 echo "==> Creating $APP_NAME.app bundle…"
 APP_BUNDLE="$APP_NAME.app"

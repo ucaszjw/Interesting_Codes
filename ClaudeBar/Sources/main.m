@@ -6,6 +6,8 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <dlfcn.h>
 #import <objc/message.h>
+#import "Dashboard.h"
+#import "DataFetcher.h"
 
 // ============================================================
 // DFRFoundation private API (pins Touch Bar to Control Strip)
@@ -41,24 +43,6 @@ static const double kPriceProCacheHit   = 0.025;
 // DataFetcher — reads Claude Code config & session files,
 //              calls DeepSeek balance API
 // ============================================================
-
-typedef struct {
-    NSInteger input;
-    NSInteger output;
-    NSInteger cacheRead;
-    NSInteger cacheCreate;
-} TokenUsage;
-
-@interface DataFetcher : NSObject
-- (NSString *)fetchModel;
-- (NSString *)fetchAPIKey;
-- (TokenUsage)fetchTodayUsage;
-/// Per-model usage: modelName → @{@"input":NSNumber, @"output":NSNumber, @"cacheRead":NSNumber, @"cacheCreate":NSNumber}
-- (NSDictionary *)fetchTodayUsageByModel;
-/// Cost summed across all models using each model's pricing
-- (double)computeTotalCostWithModelUsage:(NSDictionary *)modelUsage;
-- (void)fetchBalanceWithForce:(BOOL)force completion:(void(^)(double))completion;
-@end
 
 @implementation DataFetcher {
     NSString *_settingsPath;
@@ -283,6 +267,110 @@ typedef struct {
     }] resume];
 }
 
+
+// -----------------------------------------------------------
+// Daily usage for chart
+// -----------------------------------------------------------
+- (NSArray *)fetchDailyUsageForLastDays:(int)days {
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"yyyy-MM-dd";
+    NSMutableDictionary *daily = [NSMutableDictionary dictionary];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSArray *projectDirs = [fm contentsOfDirectoryAtPath:_projectsPath error:nil];
+    for (NSString *dir in projectDirs) {
+        NSString *dirPath = [_projectsPath stringByAppendingPathComponent:dir];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:dirPath isDirectory:&isDir] || !isDir) continue;
+        for (NSString *file in [fm contentsOfDirectoryAtPath:dirPath error:nil]) {
+            if (![file hasSuffix:@".jsonl"]) continue;
+            [self accumulateTokensByDate:[dirPath stringByAppendingPathComponent:file] into:daily];
+        }
+    }
+    NSMutableArray *result = [NSMutableArray array];
+    for (int i = days - 1; i >= 0; i--) {
+        NSDate *d = [NSDate dateWithTimeIntervalSinceNow:-i * 86400];
+        NSNumber *v = daily[[df stringFromDate:d]] ?: @0;
+        [result addObject:v];
+    }
+    return result;
+}
+
+- (void)accumulateTokensByDate:(NSString *)path into:(NSMutableDictionary *)daily {
+    NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+    if (!data) return;
+    NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!content) return;
+    [content enumerateLinesUsingBlock:^(NSString *line, BOOL *stop) {
+        NSRange tr = [line rangeOfString:@"\"timestamp\":\""];
+        if (tr.location == NSNotFound) return;
+        NSString *rest = [line substringFromIndex:tr.location + tr.length];
+        if (rest.length < 10) return;
+        NSString *date = [rest substringToIndex:10];
+        NSInteger inp = -1, out = -1, cache = -1;
+        for (NSString *key in @[@"input_tokens", @"output_tokens", @"cache_read_input_tokens"]) {
+            NSRange r = [line rangeOfString:[NSString stringWithFormat:@"\"%@\":", key]];
+            if (r.location == NSNotFound) continue;
+            NSScanner *sc = [NSScanner scannerWithString:[line substringFromIndex:r.location + r.length]];
+            NSInteger n = 0;
+            if ([sc scanInteger:&n] && n >= 0) {
+                if ([key isEqual:@"input_tokens"]) inp = n;
+                else if ([key isEqual:@"output_tokens"]) out = n;
+                else if ([key isEqual:@"cache_read_input_tokens"]) cache = n;
+            }
+        }
+        if (inp < 0 || out < 0) return;
+        daily[date] = @([daily[date] integerValue] + inp + out + (cache > 0 ? cache : 0));
+    }];
+}
+
+// -----------------------------------------------------------
+// Project ranking
+// -----------------------------------------------------------
+- (NSArray *)fetchProjectRanking {
+    NSMutableArray *ranking = [NSMutableArray array];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSArray *projectDirs = [fm contentsOfDirectoryAtPath:_projectsPath error:nil];
+    for (NSString *dir in projectDirs) {
+        NSString *dirPath = [_projectsPath stringByAppendingPathComponent:dir];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:dirPath isDirectory:&isDir] || !isDir) continue;
+        NSInteger totalInp = 0, totalOut = 0;
+        for (NSString *file in [fm contentsOfDirectoryAtPath:dirPath error:nil]) {
+            if (![file hasSuffix:@".jsonl"]) continue;
+            [self accumulateProjectTokens:[dirPath stringByAppendingPathComponent:file]
+                                   input:&totalInp output:&totalOut];
+        }
+        NSInteger totalTokens = totalInp + totalOut;
+        if (totalTokens == 0) continue;
+        double cost = (totalInp * 1.0 + totalOut * 2.0) / 1000000.0;
+        [ranking addObject:@{@"name": dir, @"tokens": @(totalTokens), @"cost": @(cost)}];
+    }
+    [ranking sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [b[@"tokens"] compare:a[@"tokens"]];
+    }];
+    return ranking;
+}
+
+- (void)accumulateProjectTokens:(NSString *)path input:(NSInteger *)inp output:(NSInteger *)out {
+    NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+    if (!data) return;
+    NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!content) return;
+    [content enumerateLinesUsingBlock:^(NSString *line, BOOL *stop) {
+        NSInteger i = -1, o = -1;
+        for (NSString *key in @[@"input_tokens", @"output_tokens"]) {
+            NSRange r = [line rangeOfString:[NSString stringWithFormat:@"\"%@\":", key]];
+            if (r.location == NSNotFound) continue;
+            NSScanner *sc = [NSScanner scannerWithString:[line substringFromIndex:r.location + r.length]];
+            NSInteger n = 0;
+            if ([sc scanInteger:&n] && n >= 0) {
+                if ([key isEqual:@"input_tokens"]) i = n;
+                else if ([key isEqual:@"output_tokens"]) o = n;
+            }
+        }
+        if (i >= 0 && o >= 0) { *inp += i; *out += o; }
+    }];
+}
 @end
 
 // ============================================================
