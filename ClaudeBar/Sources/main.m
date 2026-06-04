@@ -741,29 +741,31 @@ static NSString *resolveDesktopModel(NSString *desktopModel);
 
 
 
-    // Poll at 120ms: detect typing bursts (3+ key events in 1.5s)
+    // Poll at 200ms: detect typing bursts (3+ key events in ~1s)
     // Single presses (Enter, arrows) don't trigger dismiss
     _keyBurstCount = 0;
     _keyBurstStart = [[NSDate date] timeIntervalSince1970];
     _lastKeyEventTime = [[NSDate date] timeIntervalSince1970];
 
-    _typingTimer = [NSTimer scheduledTimerWithTimeInterval:0.12 repeats:YES block:^(NSTimer *t) {
+    _typingTimer = [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer *t) {
         if (!_pinned) return;
 
         double elapsed = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState, kCGEventKeyDown);
         double now = [[NSDate date] timeIntervalSince1970];
 
-        // Count key events: if a key was pressed since last check
-        if (elapsed < 0.1 && (now - _lastKeyEventTime) > 0.08) {
+        if (elapsed < 0.18) {
+            // Key was pressed since last check
             _keyBurstCount++;
             _lastKeyEventTime = now;
-            if (now - _keyBurstStart > 1.5) {
+            if (now - _keyBurstStart > 1.0) {
                 _keyBurstStart = now;
                 _keyBurstCount = 1;
             }
+        } else {
+            _keyBurstCount = 0;
         }
 
-        // Dismiss only on sustained typing (3+ events in 1.5s)
+        // Dismiss on sustained typing (3+ events in ~1s)
         if (_keyBurstCount >= 3 && !_dismissedForTyping) {
             SEL sel = NSSelectorFromString(@"dismissSystemModalTouchBar:");
             if ([NSTouchBar respondsToSelector:sel])
