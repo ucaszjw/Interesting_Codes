@@ -11,3 +11,4 @@ __pycache__/
 *.o
 *.app
 .build/
+.cc-connect/
