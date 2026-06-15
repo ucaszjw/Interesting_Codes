@@ -375,9 +375,18 @@ func (p *Platform) handleMessage(payload map[string]any) {
 			"simp": "母狗", "母狗": "母狗",
 			"cute": "萌妹", "萌妹": "萌妹",
 			"straight": "直男", "直男": "直男",
+			"succubus": "魅魔", "魅魔": "魅魔",
+			"feminist": "女拳", "女拳": "女拳",
+			"taoist": "赛博道士", "道士": "赛博道士",
+			"ruozhi": "弱智吧吧友", "弱智": "弱智吧吧友",
+			"capitalist": "资本家", "资本家": "资本家",
+			"marketing": "营销号", "营销号": "营销号",
+			"repeater": "复读机", "复读机": "复读机",
+			"poet": "文豪", "文豪": "文豪",
+			"reasonable": "理中客", "理中客": "理中客",
 		}
 		if name == "" {
-			available := "贴吧老哥/tieba, 猫娘/neko, 老干部/cadre, 母狗/simp, 萌妹/cute, 直男/straight"
+			available := "贴吧老哥/tieba, 猫娘/neko, 老干部/cadre, 母狗/simp, 萌妹/cute, 直男/straight, 魅魔/succubus, 女拳/feminist, 赛博道士/taoist, 弱智吧吧友/ruozhi, 资本家/capitalist, 营销号/marketing, 复读机/repeater, 文豪/poet, 理中客/reasonable"
 			p.Reply(context.Background(), rctx, "可用人设: "+available)
 			return
 		}
@@ -396,7 +405,7 @@ func (p *Platform) handleMessage(payload map[string]any) {
 			}
 			p.handler(p, newMsg)
 		} else {
-			available := "贴吧老哥/tieba, 猫娘/neko, 老干部/cadre, 母狗/simp, 萌妹/cute, 直男/straight"
+			available := "贴吧老哥/tieba, 猫娘/neko, 老干部/cadre, 母狗/simp, 萌妹/cute, 直男/straight, 魅魔/succubus, 女拳/feminist, 赛博道士/taoist, 弱智吧吧友/ruozhi, 资本家/capitalist, 营销号/marketing, 复读机/repeater, 文豪/poet, 理中客/reasonable"
 			p.Reply(context.Background(), rctx, "可用人设: "+available)
 		}
 		return
