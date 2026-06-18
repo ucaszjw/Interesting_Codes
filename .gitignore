@@ -12,3 +12,4 @@ __pycache__/
 *.app
 .build/
 .cc-connect/
+*.bin

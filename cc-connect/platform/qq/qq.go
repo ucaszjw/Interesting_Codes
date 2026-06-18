@@ -7,7 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +55,13 @@ type Platform struct {
 	emojiLikeDef   string // default emoji_id for reaction; "" = "76" (👍)
 	recallComment  bool   // comment when someone recalls a message in group
 	checkMute      bool   // skip sending if bot is muted in the group
+	whisperEnabled bool   // enable local Whisper ASR for voice messages
+	whisperModel   string // path to whisper model file (.bin)
+	replyProbability int    // base reply probability (%, 0 = disabled)
+	replySkipPenalty int    // probability decrease per skipped message
+	replyColdBoost  int    // probability increase per 10s of silence
+	replyProbMin    int    // minimum probability (%)
+	replyProbMax    int    // maximum probability (%)
 
 	// Scheduled tasks (cron): the prompt is sent to the AI for dynamic generation
 	cronJobs      []cronJobConfig
@@ -69,6 +80,12 @@ type Platform struct {
 
 	// Persona mapping: sessionKey -> persona tag name
 	personaMap sync.Map
+
+		// Reply probability state per sessionKey
+		replyStateMap sync.Map
+
+		// Message buffer per sessionKey (accumulates group messages between AI replies)
+		msgBufferMap sync.Map
 }
 
 // cronJobConfig defines a scheduled prompt sent to the AI for dynamic message generation.
@@ -92,6 +109,18 @@ type muteCacheEntry struct {
 	cachedAt time.Time
 }
 
+// replyState tracks probability-based reply state per session.
+type replyState struct {
+	skipCount     int       // consecutive skipped messages
+	lastReplyTime time.Time // last time we replied
+}
+
+// msgBuffer accumulates group messages between AI replies for full context.
+type msgBuffer struct {
+	lines []string  // each: "sender_name(qq): text"
+	start time.Time // when first message was added
+}
+
 func New(opts map[string]any) (core.Platform, error) {
 	wsURL, _ := opts["ws_url"].(string)
 	if wsURL == "" {
@@ -110,7 +139,31 @@ func New(opts map[string]any) (core.Platform, error) {
 	emojiLike, _ := opts["emoji_like"].(bool)
 	recallComment, _ := opts["recall_comment"].(bool)
 	checkMute, _ := opts["check_mute"].(bool)
+	whisperEnabled, _ := opts["whisper_enabled"].(bool)
+	whisperModel, _ := opts["whisper_model"].(string)
+	replyProbability, _ := opts["reply_probability"].(int)
+	replySkipPenalty, _ := opts["reply_skip_penalty"].(int)
+	replyColdBoost, _ := opts["reply_cold_boost"].(int)
+	replyProbMin, _ := opts["reply_prob_min"].(int)
+	replyProbMax, _ := opts["reply_prob_max"].(int)
 	emojiLikeDef, _ := opts["emoji_like_id"].(string)
+
+	// Default probability values if not configured
+	if replyProbability == 0 {
+		replyProbability = 30
+	}
+	if replySkipPenalty == 0 {
+		replySkipPenalty = 1
+	}
+	if replyColdBoost == 0 {
+		replyColdBoost = 5
+	}
+	if replyProbMin == 0 {
+		replyProbMin = 10
+	}
+	if replyProbMax == 0 {
+		replyProbMax = 50
+	}
 
 	// Cron jobs: prompts sent to the AI for dynamic generation
 	var cronJobs []cronJobConfig
@@ -141,6 +194,13 @@ func New(opts map[string]any) (core.Platform, error) {
 		emojiLike:             emojiLike,
 		recallComment:         recallComment,
 		checkMute:             checkMute,
+			whisperEnabled:         whisperEnabled,
+			whisperModel:           whisperModel,
+			replyProbability:      replyProbability,
+			replySkipPenalty:      replySkipPenalty,
+			replyColdBoost:        replyColdBoost,
+			replyProbMin:          replyProbMin,
+			replyProbMax:          replyProbMax,
 		emojiLikeDef:          emojiLikeDef,
 		cronJobs:              cronJobs,
 		recentMessages:        make(map[int64]*recallEntry),
@@ -322,6 +382,12 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		sessionKey = fmt.Sprintf("qq:%d", userID)
 	}
 
+
+	// Buffer: accumulate group messages for full context between AI replies
+	if msgType == "group" {
+		p.addToBuffer(sessionKey, userName, userID, text)
+	}
+
 	rctx := &replyContext{
 		messageType: msgType,
 		userID:      userID,
@@ -336,6 +402,8 @@ func (p *Platform) handleMessage(payload map[string]any) {
 
 	// Set ExtraContent to indicate chat type so the agent can differentiate behavior
 	var extraContent string
+	shortReply := false
+
 	if msgType == "group" || (p.toolAdminOnly && !p.isAdmin(userID)) {
 		extraContent = "[群聊消息]"
 		// Add persona tag after [群聊消息] (before sender info)
@@ -364,6 +432,7 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		p.Reply(context.Background(), rctx, "❌ 只有管理员才能批准操作，你一边呆着去。")
 		return
 	}
+
 
 	// Handle /persona command (persona switching)
 	if msgType == "group" && strings.HasPrefix(text, "/persona") && (len(text) == len("/persona") || text[len("/persona")] == ' ') {
@@ -410,7 +479,35 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		}
 		return
 	}
+	// Probability-based reply: skip unless probability triggers or @bot
+	if msgType == "group" && !p.isBotMentioned(payload) && !strings.HasPrefix(text, "/") && audio == nil && p.replyProbability > 0 {
+		if !p.shouldReply(sessionKey, text) {
+			slog.Info("qq: skip, probability", "session", sessionKey, "text", truncateText(text, 20))
+			return
+		}
+			shortReply = true
+	}
 
+	// Reset reply state on @bot (概率跳过了 shouldReply)
+	if msgType == "group" && p.isBotMentioned(payload) {
+		if raw, ok := p.replyStateMap.Load(sessionKey); ok {
+			rs := raw.(*replyState)
+			rs.skipCount = 0
+			rs.lastReplyTime = time.Now()
+		}
+	}
+
+	// When replying, flush buffered messages as context
+	if msgType == "group" {
+		if buffered := p.flushBuffer(sessionKey); buffered != "" {
+			text = buffered
+		}
+	}
+
+	// 概率触发时简短回复
+	if shortReply {
+		extraContent += " 简短回复，像日常聊天一样说一两句即可，不要长篇大论"
+	}
 	msg := &core.Message{
 		SessionKey: sessionKey,
 		Platform:   "qq",
@@ -573,6 +670,38 @@ func (p *Platform) parseMessage(payload map[string]any) (string, []core.ImageAtt
 					})
 				}
 			case "record":
+				var keys []string
+				for key := range data { keys = append(keys, key) }
+				slog.Info("qq: voice data", "keys", keys, "file", data["file"], "path", data["path"])
+				// Check for QQ ASR text (voice-to-text transcription)
+				if t, ok := data["text"].(string); ok && t != "" {
+					textParts = append(textParts, "[语音转文字: "+t+"]")
+				} else if file, ok := data["file"].(string); ok {
+					// Extract duration from filename if available, e.g. "flag_49s.amr"
+					duration := ""
+					if idx := strings.LastIndex(file, "_"); idx >= 0 {
+						if end := strings.Index(file[idx:], "s"); end > 1 {
+							duration = file[idx+1:idx+end]
+						}
+					}
+					if duration != "" {
+						textParts = append(textParts, "[语音 "+duration+"s]")
+					} else {
+						textParts = append(textParts, "[语音消息]")
+					}
+				} else {
+					textParts = append(textParts, "[语音消息]")
+				}
+				// Voice-to-text via local Whisper
+				if p.whisperEnabled && p.whisperModel != "" {
+					slog.Info("qq: whisper processing", "has_url", data["url"] != nil)
+					if url, ok := data["url"].(string); ok && url != "" {
+						if transcript := p.transcribeAudio(url); transcript != "" {
+							textParts[len(textParts)-1] = "[语音: " + transcript + "]"
+						}
+					}
+				}
+				// Also download audio for agents that support it
 				if url, ok := data["url"].(string); ok && url != "" {
 					audioData, _, err := downloadFile(url)
 					if err != nil {
@@ -1009,6 +1138,179 @@ func (p *Platform) makeGroupExtraContent(sessionKey string) string {
 		extra += "[贴吧老哥]"
 	}
 	return extra
+}
+
+
+
+// ── Message buffer ──────────────────────────────
+
+func (p *Platform) addToBuffer(sessionKey string, userName string, userID int64, text string) {
+	raw, _ := p.msgBufferMap.LoadOrStore(sessionKey, &msgBuffer{lines: []string{}, start: time.Now()})
+	buf := raw.(*msgBuffer)
+
+	// Format: "userName(userID): text"
+	if userName != "" {
+		buf.lines = append(buf.lines, fmt.Sprintf("%s(%d): %s", userName, userID, text))
+	} else {
+		buf.lines = append(buf.lines, fmt.Sprintf("(%d): %s", userID, text))
+	}
+}
+
+// flushBuffer returns all buffered messages as a single string and clears the buffer.
+func (p *Platform) flushBuffer(sessionKey string) string {
+	raw, ok := p.msgBufferMap.Load(sessionKey)
+	if !ok {
+		return ""
+	}
+	buf := raw.(*msgBuffer)
+
+	// Check freshness: if buffer is older than 30 min, discard
+	if time.Since(buf.start) > 30*time.Minute {
+		p.msgBufferMap.Delete(sessionKey)
+		return ""
+	}
+
+	if len(buf.lines) <= 1 {
+		// Only current message, no need for special formatting
+		p.msgBufferMap.Delete(sessionKey)
+		return ""
+	}
+
+	result := "以下是你上次回复之后的群聊记录：\n\n"
+	for _, line := range buf.lines {
+		result += line + "\n"
+	}
+	p.msgBufferMap.Delete(sessionKey)
+	return result
+}
+
+// ── Reply probability ───────────────────────────
+
+func (p *Platform) shouldReply(sessionKey string, text string) bool {
+	// Load or init state
+	raw, _ := p.replyStateMap.LoadOrStore(sessionKey, &replyState{})
+	rs := raw.(*replyState)
+
+	now := time.Now()
+
+	// Calculate probability
+	P := float64(p.replyProbability)
+
+	// 1. Skip penalty: each skipped message reduces probability
+	skipDeduction := float64(rs.skipCount) * float64(p.replySkipPenalty)
+	P -= skipDeduction
+
+	// 2. Cold boost: silence after last reply increases probability
+	if !rs.lastReplyTime.IsZero() {
+		silence := now.Sub(rs.lastReplyTime)
+		if silence > 30*time.Second {
+			extra := float64(silence.Seconds()-30) / 10.0 * float64(p.replyColdBoost)
+			P += extra
+		}
+	}
+
+	// Clamp
+	minP := float64(p.replyProbMin)
+	maxP := float64(p.replyProbMax)
+	if P < minP {
+		P = minP
+	}
+	if P > maxP {
+		P = maxP
+	}
+
+	// Content-based modifiers
+	// Questions: double probability
+	if strings.Contains(text, "?") || strings.Contains(text, "？") ||
+		strings.Contains(text, "吗") || strings.Contains(text, "什么") ||
+		strings.Contains(text, "啥") || strings.Contains(text, "怎么") {
+		P *= 2
+		if P > maxP {
+			P = maxP
+		}
+	}
+
+	// Short / pure emoji: halve probability
+	if len([]rune(text)) <= 2 {
+		P /= 2
+		if P < minP {
+			P = minP
+		}
+	}
+
+	// Roll the dice
+	replied := rand.Float64()*100 < P
+	slog.Info("qq: reply prob",
+		"prob", int(P),
+		"skip", rs.skipCount,
+		"text", truncateText(text, 20),
+		"reply", replied)
+
+	if replied {
+		// Replied: reset state
+		rs.skipCount = 0
+		rs.lastReplyTime = now
+		return true
+	}
+
+	// Skipped: increment counter (state persists for next message)
+	rs.skipCount++
+	return false
+}
+
+
+// ── Voice transcription ─────────────────────────
+
+// transcribeAudio downloads an audio file and runs Whisper via FFmpeg pipe to get text.
+func (p *Platform) transcribeAudio(url string) string {
+	data, _, err := downloadFile(url)
+	if err != nil {
+		slog.Info("qq: whisper download failed", "error", err)
+		return ""
+	}
+
+	// Write raw audio to temp file
+	rawFile := filepath.Join(os.TempDir(), fmt.Sprintf("qq_raw_%d", time.Now().UnixNano()))
+	if err := os.WriteFile(rawFile, data, 0644); err != nil {
+		slog.Info("qq: whisper write failed", "error", err)
+		return ""
+	}
+	defer os.Remove(rawFile)
+
+	// Convert to WAV via FFmpeg (AMR/SILK → PCM)
+	wavFile := rawFile + ".wav"
+	defer os.Remove(wavFile)
+
+	ffmpeg := exec.Command("ffmpeg", "-y", "-i", rawFile, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wavFile)
+	if err := ffmpeg.Run(); err != nil {
+		slog.Info("qq: whisper ffmpeg convert failed", "error", err)
+		return ""
+	}
+
+	outFile := rawFile + ".txt"
+	defer os.Remove(outFile)
+
+	cmd := exec.Command("whisper-cli",
+		"-m", p.whisperModel,
+		"-f", wavFile,
+		"-of", rawFile,
+		"-otxt",
+		"-l", "zh",
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		slog.Warn("qq: whisper failed", "error", err, "output", string(output))
+		return ""
+	}
+
+	transcript, err := os.ReadFile(outFile)
+	if err != nil {
+		slog.Info("qq: whisper read output failed", "error", err)
+		return ""
+	}
+
+	result := strings.TrimSpace(string(transcript))
+	slog.Info("qq: whisper transcript", "text", truncateText(result, 60))
+	return result
 }
 
 // ── Helpers ──
