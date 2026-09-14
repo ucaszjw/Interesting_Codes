@@ -180,6 +180,10 @@ type Message struct {
 	ReplyCtx     any                 // platform-specific context needed for replying
 	FromVoice    bool                // true if message originated from voice transcription
 	ModeOverride string              // if set, temporarily override agent permission mode for this message
+	// BlockPermissionApproval marks a sender who may not authorize tool use, e.g. a
+	// non-admin in a shared group session. The engine consults it only while a
+	// permission request is actually pending, so ordinary chat is never affected.
+	BlockPermissionApproval bool
 }
 
 // EventType distinguishes different kinds of agent output.

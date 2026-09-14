@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/chenhg5/cc-connect/core"
 	"github.com/gorilla/websocket"
@@ -57,11 +58,27 @@ type Platform struct {
 	checkMute      bool   // skip sending if bot is muted in the group
 	whisperEnabled bool   // enable local Whisper ASR for voice messages
 	whisperModel   string // path to whisper model file (.bin)
-	replyProbability int    // base reply probability (%, 0 = disabled)
-	replySkipPenalty int    // probability decrease per skipped message
-	replyColdBoost  int    // probability increase per 10s of silence
-	replyProbMin    int    // minimum probability (%)
-	replyProbMax    int    // maximum probability (%)
+
+	// TTS: synthesis and gating live in core (see core/tts.go). The platform only
+	// picks the voice per persona and may thin out voice replies by probability.
+	voiceProbability int               // % chance an eligible reply is spoken; 0 = always (no gating)
+	personaVoices    map[string]string // persona tag -> voice name understood by the configured provider
+
+	// Chat scope: which chat types the bot answers in. Switched at runtime by the
+	// admin-only /scope command and persisted under the data dir.
+	scopeMu   sync.Mutex
+	chatScope string // chatScopeAll | chatScopeGroup | chatScopePrivate
+	scopePath string // "" when the data dir / project name were not injected
+
+	replyProbability int // base reply probability (%, 0 = disabled)
+	replySkipPenalty int // probability decrease per skipped message
+	replyColdBoost   int // probability increase per 10s of silence
+	replyProbMin     int // minimum probability (%)
+	replyProbMax     int // maximum probability (%)
+	// replyCooldown is the minimum number of seconds between replies to messages
+	// that did not address the bot. An @-mention always gets an answer and neither
+	// honours nor resets this, so a direct question is never ignored.
+	replyCooldown int
 
 	// Scheduled tasks (cron): the prompt is sent to the AI for dynamic generation
 	cronJobs      []cronJobConfig
@@ -81,12 +98,27 @@ type Platform struct {
 	// Persona mapping: sessionKey -> persona tag name
 	personaMap sync.Map
 
-		// Reply probability state per sessionKey
-		replyStateMap sync.Map
+	// Reply probability state per sessionKey
+	replyStateMap sync.Map
 
-		// Message buffer per sessionKey (accumulates group messages between AI replies)
-		msgBufferMap sync.Map
+	// Message buffer per sessionKey (accumulates group messages between AI replies)
+	msgBufferMap sync.Map
+
+	// Events handed from readLoop to dispatchLoop. Handling happens off the read
+	// loop so API calls issued from a handler (the /scope and /persona replies)
+	// can still have their responses routed, which readLoop is responsible for.
+	msgQueue chan map[string]any
 }
+
+// msgQueueSize bounds how many events may wait behind a slow handler.
+const msgQueueSize = 64
+
+// Chat scope values for the chat_scope option and the /scope command.
+const (
+	chatScopeAll     = "all"     // answer in both private chats and groups
+	chatScopeGroup   = "group"   // answer in groups only
+	chatScopePrivate = "private" // answer in private chats only
+)
 
 // cronJobConfig defines a scheduled prompt sent to the AI for dynamic message generation.
 type cronJobConfig struct {
@@ -141,28 +173,40 @@ func New(opts map[string]any) (core.Platform, error) {
 	checkMute, _ := opts["check_mute"].(bool)
 	whisperEnabled, _ := opts["whisper_enabled"].(bool)
 	whisperModel, _ := opts["whisper_model"].(string)
-	replyProbability, _ := opts["reply_probability"].(int)
-	replySkipPenalty, _ := opts["reply_skip_penalty"].(int)
-	replyColdBoost, _ := opts["reply_cold_boost"].(int)
-	replyProbMin, _ := opts["reply_prob_min"].(int)
-	replyProbMax, _ := opts["reply_prob_max"].(int)
+	voiceProbability := optInt(opts, "voice_probability")
+	replyProbability := optIntOr(opts, "reply_probability", 30)
+	replySkipPenalty := optIntOr(opts, "reply_skip_penalty", 1)
+	replyColdBoost := optIntOr(opts, "reply_cold_boost", 5)
+	replyProbMin := optIntOr(opts, "reply_prob_min", 10)
+	replyProbMax := optIntOr(opts, "reply_prob_max", 50)
+	replyCooldown := optInt(opts, "reply_cooldown")
 	emojiLikeDef, _ := opts["emoji_like_id"].(string)
 
-	// Default probability values if not configured
-	if replyProbability == 0 {
-		replyProbability = 30
+	personaVoices := map[string]string{}
+	if m, ok := opts["persona_voices"].(map[string]any); ok {
+		for persona, v := range m {
+			if voice, ok := v.(string); ok && voice != "" {
+				personaVoices[persona] = voice
+			}
+		}
 	}
-	if replySkipPenalty == 0 {
-		replySkipPenalty = 1
+
+	// Chat scope: the config value is the default, a previously persisted /scope
+	// switch wins because it records the most recent explicit intent.
+	chatScope := parseChatScope(toString(opts["chat_scope"]))
+	if chatScope == "" {
+		chatScope = chatScopeAll
 	}
-	if replyColdBoost == 0 {
-		replyColdBoost = 5
+	scopePath := chatScopeStatePath(opts)
+	if saved := loadChatScope(scopePath); saved != "" {
+		chatScope = saved
 	}
-	if replyProbMin == 0 {
-		replyProbMin = 10
+
+	if voiceProbability < 0 {
+		voiceProbability = 0
 	}
-	if replyProbMax == 0 {
-		replyProbMax = 50
+	if voiceProbability > 100 {
+		voiceProbability = 100
 	}
 
 	// Cron jobs: prompts sent to the AI for dynamic generation
@@ -194,13 +238,18 @@ func New(opts map[string]any) (core.Platform, error) {
 		emojiLike:             emojiLike,
 		recallComment:         recallComment,
 		checkMute:             checkMute,
-			whisperEnabled:         whisperEnabled,
-			whisperModel:           whisperModel,
-			replyProbability:      replyProbability,
-			replySkipPenalty:      replySkipPenalty,
-			replyColdBoost:        replyColdBoost,
-			replyProbMin:          replyProbMin,
-			replyProbMax:          replyProbMax,
+		whisperEnabled:        whisperEnabled,
+		whisperModel:          whisperModel,
+		voiceProbability:      voiceProbability,
+		personaVoices:         personaVoices,
+		chatScope:             chatScope,
+		scopePath:             scopePath,
+		replyProbability:      replyProbability,
+		replySkipPenalty:      replySkipPenalty,
+		replyColdBoost:        replyColdBoost,
+		replyProbMin:          replyProbMin,
+		replyProbMax:          replyProbMax,
+		replyCooldown:         replyCooldown,
 		emojiLikeDef:          emojiLikeDef,
 		cronJobs:              cronJobs,
 		recentMessages:        make(map[int64]*recallEntry),
@@ -225,8 +274,25 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 
 	slog.Info("qq: connected to OneBot", "url", p.wsURL)
 
+	if p.replyProbability > 0 {
+		slog.Info("qq: reply throttle",
+			"at_mention", "always",
+			"probability", p.replyProbability,
+			"prob_range", fmt.Sprintf("%d-%d", p.replyProbMin, p.replyProbMax),
+			"cold_boost_per_10s", p.replyColdBoost,
+			"skip_penalty", p.replySkipPenalty,
+			"cooldown_s", p.replyCooldown)
+	} else {
+		slog.Warn("qq: probability gating disabled, every group message reaches the agent")
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
+
+	if p.msgQueue == nil {
+		p.msgQueue = make(chan map[string]any, msgQueueSize)
+	}
+	go p.dispatchLoop(ctx)
 
 	// Start readLoop BEFORE callAPI: callAPI's response is routed by readLoop,
 	// so calling it first would always time out after 15s and leave selfID=0,
@@ -284,13 +350,33 @@ func (p *Platform) readLoop(ctx context.Context) {
 			continue
 		}
 
-		// Otherwise it's an event
-		postType, _ := payload["post_type"].(string)
-		switch postType {
-		case "message":
-			p.handleMessage(payload)
-		case "notice":
-			p.handleNotice(payload)
+		// Otherwise it's an event; hand it to the dispatcher so this loop stays
+		// free to route API responses and answer pings.
+		select {
+		case p.msgQueue <- payload:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// dispatchLoop runs message and notice handling on its own goroutine. Handlers
+// issue API calls (incoming-message replies, emoji reactions, mute checks) whose
+// responses can only be routed by readLoop, so handling events inline would
+// deadlock until callAPI's 15s timeout. Running them here keeps readLoop free
+// while still serializing handlers against each other.
+func (p *Platform) dispatchLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-p.msgQueue:
+			switch ev["post_type"] {
+			case "message":
+				p.handleMessage(ev)
+			case "notice":
+				p.handleNotice(ev)
+			}
 		}
 	}
 }
@@ -348,6 +434,13 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		return
 	}
 
+	// Chat scope: drop chats the bot is not answering in. Text is read without
+	// downloading attachments so ignored chats cost nothing.
+	if p.scopeBlocks(msgType, rawTextOf(payload)) {
+		slog.Debug("qq: ignoring message outside chat scope", "scope", p.currentScope(), "type", msgType)
+		return
+	}
+
 	// If require_at is set, only respond to group messages that @ the bot
 	if p.requireAt && msgType == "group" && !p.isBotMentioned(payload) {
 		return
@@ -366,7 +459,7 @@ func (p *Platform) handleMessage(payload map[string]any) {
 	}
 
 	// Parse message content from CQ message array or raw_message
-	text, images, audio := p.parseMessage(payload)
+	text, images, audio, fromVoice := p.parseMessage(payload)
 	if text == "" && len(images) == 0 && audio == nil {
 		return
 	}
@@ -382,7 +475,6 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		sessionKey = fmt.Sprintf("qq:%d", userID)
 	}
 
-
 	// Buffer: accumulate group messages for full context between AI replies
 	if msgType == "group" {
 		p.addToBuffer(sessionKey, userName, userID, text)
@@ -395,9 +487,17 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		messageID:   int32(messageID),
 	}
 
+	// Handle /scope (admin-only) before anything group-specific so switching back
+	// from "only private" is possible from a group and vice versa.
+	if isCommand(text, "/scope") {
+		p.handleScopeCommand(rctx, userID, text)
+		return
+	}
+
 	var chatName string
 	if msgType == "group" {
 		chatName = p.resolveGroupName(groupID)
+		rctx.persona = p.personaFor(sessionKey)
 	}
 
 	// Set ExtraContent to indicate chat type so the agent can differentiate behavior
@@ -408,11 +508,7 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		extraContent = "[群聊消息]"
 		// Add persona tag after [群聊消息] (before sender info)
 		if msgType == "group" {
-			if tag, ok := p.personaMap.Load(sessionKey); ok {
-				extraContent = "[群聊消息][" + tag.(string) + "]" 
-			} else {
-				extraContent = "[群聊消息][贴吧老哥]"
-			}
+			extraContent = p.makeGroupExtraContent(sessionKey)
 			if userName != "" {
 				extraContent = fmt.Sprintf("%s %s(%d):", extraContent, userName, userID)
 			} else {
@@ -427,15 +523,13 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		modeOverride = "plan"
 	}
 
-	// Block non-admin users from approving tool permission requests
-	if p.toolAdminOnly && !p.isAdmin(userID) && isPermissionApproval(text) {
-		p.Reply(context.Background(), rctx, "❌ 只有管理员才能批准操作，你一边呆着去。")
-		return
-	}
-
+	// Permission replies are the engine's call: only it knows whether a request is
+	// actually pending. All this adapter does is say who is not allowed to
+	// authorize tool use, and the engine enforces that at the point of decision —
+	// so a plain "好的" in chat is treated as chat, not as a refused approval.
 
 	// Handle /persona command (persona switching)
-	if msgType == "group" && strings.HasPrefix(text, "/persona") && (len(text) == len("/persona") || text[len("/persona")] == ' ') {
+	if msgType == "group" && isCommand(text, "/persona") {
 		name := strings.TrimSpace(text[len("/persona"):])
 		validPersonas := map[string]string{
 			"tieba": "贴吧老哥", "老哥": "贴吧老哥",
@@ -479,26 +573,28 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		}
 		return
 	}
-	// Probability-based reply: skip unless probability triggers or @bot
-	if msgType == "group" && !p.isBotMentioned(payload) && !strings.HasPrefix(text, "/") && audio == nil && p.replyProbability > 0 {
+	// Control messages are answered unconditionally and are never throttled, so
+	// admin workflows stay responsive. Only recognized commands count: treating
+	// any "/" prefix as a command let "/anything" bypass the throttle.
+	control := isControlCommand(text)
+
+	// Probability-based reply: skip unless probability triggers or the bot was
+	// addressed directly. Being @-mentioned answers 100% of the time and leaves
+	// the probability state untouched, so it neither spends nor resets the
+	// ambient reply budget.
+	if msgType == "group" && !control && !p.isBotMentioned(payload) && audio == nil && p.replyProbability > 0 {
 		if !p.shouldReply(sessionKey, text) {
-			slog.Info("qq: skip, probability", "session", sessionKey, "text", truncateText(text, 20))
+			// shouldReply already logged whether it was the cooldown or the dice.
+			slog.Info("qq: skip, throttle", "session", sessionKey, "text", truncateText(text, 20))
 			return
 		}
-			shortReply = true
+		shortReply = true
 	}
 
-	// Reset reply state on @bot (概率跳过了 shouldReply)
-	if msgType == "group" && p.isBotMentioned(payload) {
-		if raw, ok := p.replyStateMap.Load(sessionKey); ok {
-			rs := raw.(*replyState)
-			rs.skipCount = 0
-			rs.lastReplyTime = time.Now()
-		}
-	}
-
-	// When replying, flush buffered messages as context
-	if msgType == "group" {
+	// When replying, flush buffered messages as context. Commands keep their own
+	// text: the engine dispatches them by looking for a leading "/", so replacing
+	// it with the backlog would silently turn e.g. /new into ordinary chat.
+	if msgType == "group" && !control {
 		if buffered := p.flushBuffer(sessionKey); buffered != "" {
 			text = buffered
 		}
@@ -509,25 +605,28 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		extraContent += " 简短回复，像日常聊天一样说一两句即可，不要长篇大论"
 	}
 	msg := &core.Message{
-		SessionKey: sessionKey,
-		Platform:   "qq",
-		MessageID:  strconv.FormatInt(messageID, 10),
-		UserID:     strconv.FormatInt(userID, 10),
-		UserName:   userName,
-		ChatName:   chatName,
+		SessionKey:   sessionKey,
+		Platform:     "qq",
+		MessageID:    strconv.FormatInt(messageID, 10),
+		UserID:       strconv.FormatInt(userID, 10),
+		UserName:     userName,
+		ChatName:     chatName,
 		Content:      text,
 		ExtraContent: extraContent,
 		Images:       images,
 		Audio:        audio,
+		FromVoice:    fromVoice,
 		ModeOverride: modeOverride,
-		ReplyCtx:     rctx,
+		// With tool_admin_only, non-admins may chat but must not authorize tool
+		// use. The engine only acts on this while a permission is pending.
+		BlockPermissionApproval: p.toolAdminOnly && !p.isAdmin(userID),
+		ReplyCtx:                rctx,
 	}
 
 	// Track recent messages for recall content lookup (group only)
 	if p.recallComment && msgType == "group" && messageID != 0 {
 		p.trackMessage(messageID, userID, text)
 	}
-
 
 	slog.Debug("qq: message received", "type", msgType, "user", userID, "text_len", len(text))
 	p.handler(p, msg)
@@ -584,6 +683,10 @@ func (p *Platform) handlePoke(payload map[string]any) {
 		msgType = "group"
 	}
 
+	if !p.scopeAllows(msgType) {
+		return
+	}
+
 	var sessionKey string
 	if msgType == "group" {
 		if p.shareSessionInChannel {
@@ -604,6 +707,7 @@ func (p *Platform) handlePoke(payload map[string]any) {
 	var chatName string
 	if msgType == "group" {
 		chatName = p.resolveGroupName(groupID)
+		rctx.persona = p.personaFor(sessionKey)
 	}
 
 	var extraContent string
@@ -633,10 +737,11 @@ func (p *Platform) handlePoke(payload map[string]any) {
 	p.handler(p, msg)
 }
 
-func (p *Platform) parseMessage(payload map[string]any) (string, []core.ImageAttachment, *core.AudioAttachment) {
+func (p *Platform) parseMessage(payload map[string]any) (string, []core.ImageAttachment, *core.AudioAttachment, bool) {
 	var textParts []string
 	var images []core.ImageAttachment
 	var audio *core.AudioAttachment
+	fromVoice := false
 
 	// OneBot message can be array of segments or a string
 	switch msg := payload["message"].(type) {
@@ -670,8 +775,11 @@ func (p *Platform) parseMessage(payload map[string]any) (string, []core.ImageAtt
 					})
 				}
 			case "record":
+				fromVoice = true
 				var keys []string
-				for key := range data { keys = append(keys, key) }
+				for key := range data {
+					keys = append(keys, key)
+				}
 				slog.Info("qq: voice data", "keys", keys, "file", data["file"], "path", data["path"])
 				// Check for QQ ASR text (voice-to-text transcription)
 				if t, ok := data["text"].(string); ok && t != "" {
@@ -681,7 +789,7 @@ func (p *Platform) parseMessage(payload map[string]any) (string, []core.ImageAtt
 					duration := ""
 					if idx := strings.LastIndex(file, "_"); idx >= 0 {
 						if end := strings.Index(file[idx:], "s"); end > 1 {
-							duration = file[idx+1:idx+end]
+							duration = file[idx+1 : idx+end]
 						}
 					}
 					if duration != "" {
@@ -740,7 +848,7 @@ func (p *Platform) parseMessage(payload map[string]any) (string, []core.ImageAtt
 		}
 	}
 
-	return strings.TrimSpace(strings.Join(textParts, "")), images, audio
+	return strings.TrimSpace(strings.Join(textParts, "")), images, audio, fromVoice
 }
 
 // Reply sends a message as a reply to an incoming message.
@@ -932,6 +1040,9 @@ func (p *Platform) handleGroupRecall(payload map[string]any) {
 	if !p.recallComment {
 		return
 	}
+	if !p.scopeAllows("group") {
+		return
+	}
 
 	groupID := jsonInt64(payload, "group_id")
 	operatorID := jsonInt64(payload, "operator_id")
@@ -959,7 +1070,7 @@ func (p *Platform) handleGroupRecall(payload map[string]any) {
 	}
 
 	sessionKey := fmt.Sprintf("qq:g:%d", groupID)
-	rctx := &replyContext{messageType: "group", groupID: groupID}
+	rctx := &replyContext{messageType: "group", groupID: groupID, persona: p.personaFor(sessionKey)}
 	msg := &core.Message{
 		SessionKey:   sessionKey,
 		Platform:     "qq",
@@ -1041,8 +1152,6 @@ func (p *Platform) addEmojiLike(messageID int64, emojiID string) {
 	}
 }
 
-
-
 // ── Mute check ────────────────────────────────────────────────
 
 // isMutedInGroup checks if the bot is muted in the given group, with caching.
@@ -1113,9 +1222,14 @@ func (p *Platform) stopCronJobs() {
 }
 
 func (p *Platform) executeCronJob(groupID int64, prompt string, _ int) {
+	if !p.scopeAllows("group") {
+		slog.Debug("qq: skipping cron job, groups are out of scope", "group", groupID)
+		return
+	}
+
 	// Route through the AI handler so content is dynamically generated
 	sessionKey := fmt.Sprintf("qq:g:%d", groupID)
-	rctx := &replyContext{messageType: "group", groupID: groupID}
+	rctx := &replyContext{messageType: "group", groupID: groupID, persona: p.personaFor(sessionKey)}
 	msg := &core.Message{
 		SessionKey:   sessionKey,
 		Platform:     "qq",
@@ -1130,17 +1244,22 @@ func (p *Platform) executeCronJob(groupID int64, prompt string, _ int) {
 	p.handler(p, msg)
 }
 
-func (p *Platform) makeGroupExtraContent(sessionKey string) string {
-	extra := "[群聊消息]"
+// defaultPersona is used when a group session has no /persona override.
+const defaultPersona = "贴吧老哥"
+
+// personaFor returns the persona tag for a session, falling back to the default.
+func (p *Platform) personaFor(sessionKey string) string {
 	if tag, ok := p.personaMap.Load(sessionKey); ok {
-		extra += "[" + tag.(string) + "]" 
-	} else {
-		extra += "[贴吧老哥]"
+		if s, ok := tag.(string); ok && s != "" {
+			return s
+		}
 	}
-	return extra
+	return defaultPersona
 }
 
-
+func (p *Platform) makeGroupExtraContent(sessionKey string) string {
+	return "[群聊消息][" + p.personaFor(sessionKey) + "]"
+}
 
 // ── Message buffer ──────────────────────────────
 
@@ -1192,6 +1311,19 @@ func (p *Platform) shouldReply(sessionKey string, text string) bool {
 	rs := raw.(*replyState)
 
 	now := time.Now()
+
+	// Cooldown: stay quiet for a while after speaking so the bot does not weigh in
+	// on every ambient message. Only messages that did not address the bot reach
+	// this point, so a direct @-mention is never suppressed by it.
+	if p.replyCooldown > 0 && !rs.lastReplyTime.IsZero() {
+		if quiet := now.Sub(rs.lastReplyTime); quiet < time.Duration(p.replyCooldown)*time.Second {
+			rs.skipCount++
+			slog.Info("qq: skip, cooldown",
+				"session", sessionKey, "since_last_reply_s", int(quiet.Seconds()),
+				"text", truncateText(text, 20))
+			return false
+		}
+	}
 
 	// Calculate probability
 	P := float64(p.replyProbability)
@@ -1258,7 +1390,6 @@ func (p *Platform) shouldReply(sessionKey string, text string) bool {
 	return false
 }
 
-
 // ── Voice transcription ─────────────────────────
 
 // transcribeAudio downloads an audio file and runs Whisper via FFmpeg pipe to get text.
@@ -1313,6 +1444,296 @@ func (p *Platform) transcribeAudio(url string) string {
 	return result
 }
 
+// ── Voice (TTS) ─────────────────────────────────
+
+// SendAudio sends a synthesized voice message. Synthesis itself is done by the
+// engine's TTS pipeline; the platform only converts to a format NapCat accepts
+// and hands it to OneBot. Implements core.AudioSender.
+func (p *Platform) SendAudio(ctx context.Context, replyCtx any, audio []byte, format string) error {
+	rctx, ok := replyCtx.(*replyContext)
+	if !ok {
+		return fmt.Errorf("qq: SendAudio: invalid reply context type %T", replyCtx)
+	}
+	if len(audio) == 0 {
+		return fmt.Errorf("qq: SendAudio: empty audio")
+	}
+
+	// Providers emit WAV or MP3; NapCat's record segment wants MP3.
+	data := audio
+	if !strings.EqualFold(format, "mp3") {
+		converted, err := core.ConvertAudioToMP3(ctx, audio, format)
+		if err != nil {
+			return fmt.Errorf("qq: convert %s audio to mp3: %w", format, err)
+		}
+		data = converted
+	}
+
+	b64 := base64.StdEncoding.EncodeToString(data)
+	params := map[string]any{
+		"message": []map[string]any{
+			{"type": "record", "data": map[string]any{"file": "base64://" + b64}},
+		},
+	}
+
+	if rctx.messageType == "group" {
+		params["group_id"] = rctx.groupID
+		_, err := p.callAPI("send_group_msg", params)
+		return err
+	}
+	params["user_id"] = rctx.userID
+	_, err := p.callAPI("send_private_msg", params)
+	return err
+}
+
+// SelectVoice returns the TTS voice configured for the speaker's current
+// persona, or "" to fall back to the global [tts] voice.
+// Implements core.VoiceSelector.
+func (p *Platform) SelectVoice(replyCtx any) string {
+	rctx, ok := replyCtx.(*replyContext)
+	if !ok || rctx.persona == "" {
+		return ""
+	}
+	return p.personaVoices[rctx.persona]
+}
+
+// AllowVoice thins out voice replies by probability so the group does not get
+// spoken word for every message. A reply that answers a voice message is always
+// spoken; otherwise voiceProbability applies (0 = never gate, i.e. always allow).
+// Private chats are the operator's own workspace and stay text-only.
+// Implements core.VoiceGate.
+func (p *Platform) AllowVoice(replyCtx any, _ string, fromVoice bool) bool {
+	rctx, ok := replyCtx.(*replyContext)
+	if !ok || rctx.messageType != "group" {
+		return false
+	}
+	if fromVoice || p.voiceProbability <= 0 || p.voiceProbability >= 100 {
+		return true
+	}
+	return rand.Intn(100) < p.voiceProbability
+}
+
+var (
+	_ core.AudioSender   = (*Platform)(nil)
+	_ core.VoiceSelector = (*Platform)(nil)
+	_ core.VoiceGate     = (*Platform)(nil)
+)
+
+// ── Chat scope ──────────────────────────────────
+
+// currentScope returns the configured chat scope.
+func (p *Platform) currentScope() string {
+	p.scopeMu.Lock()
+	defer p.scopeMu.Unlock()
+	if p.chatScope == "" {
+		return chatScopeAll
+	}
+	return p.chatScope
+}
+
+// setScope switches the chat scope and persists it so the change survives a restart.
+func (p *Platform) setScope(scope string) {
+	p.scopeMu.Lock()
+	p.chatScope = scope
+	path := p.scopePath
+	p.scopeMu.Unlock()
+
+	if path == "" {
+		return
+	}
+	if err := saveChatScope(path, scope); err != nil {
+		slog.Warn("qq: persist chat scope failed", "path", path, "error", err)
+	}
+}
+
+// scopeAllows reports whether the bot answers in this kind of chat.
+func (p *Platform) scopeAllows(msgType string) bool {
+	switch p.currentScope() {
+	case chatScopeGroup:
+		return msgType == "group"
+	case chatScopePrivate:
+		return msgType == "private"
+	default:
+		return true
+	}
+}
+
+// scopeBlocks reports whether a message should be dropped for being outside the
+// configured scope. /scope always gets through so an admin can switch back even
+// when the chat they are typing in is currently out of scope.
+func (p *Platform) scopeBlocks(msgType, text string) bool {
+	if p.scopeAllows(msgType) {
+		return false
+	}
+	return !isCommand(text, "/scope")
+}
+
+// handleScopeCommand implements the admin-only /scope command.
+func (p *Platform) handleScopeCommand(rctx *replyContext, userID int64, text string) {
+	reply := func(msg string) {
+		if err := p.Reply(context.Background(), rctx, msg); err != nil {
+			slog.Warn("qq: reply to /scope failed", "error", err)
+		}
+	}
+
+	if !p.isAdmin(userID) {
+		if p.adminIDs == "" {
+			reply("❌ 还没配置 admin_ids，没人能切换生效范围。")
+		} else {
+			reply("❌ 只有管理员才能切换生效范围。")
+		}
+		return
+	}
+
+	arg := strings.TrimSpace(strings.TrimSpace(text)[len("/scope"):])
+	if arg == "" {
+		reply(fmt.Sprintf("当前生效范围: %s\n用法: /scope all|group|private（全部/群聊/私聊）", scopeLabel(p.currentScope())))
+		return
+	}
+
+	scope := parseChatScope(arg)
+	if scope == "" {
+		reply("❌ 参数无效。用法: /scope all|group|private（全部/群聊/私聊）")
+		return
+	}
+
+	p.setScope(scope)
+	slog.Info("qq: chat scope switched", "scope", scope, "by", userID)
+	reply("✅ 生效范围已切换为: " + scopeLabel(scope))
+}
+
+// parseChatScope normalizes a scope value, returning "" when it is not recognized.
+func parseChatScope(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "all", "both", "全部", "都":
+		return chatScopeAll
+	case "group", "群聊", "群":
+		return chatScopeGroup
+	case "private", "单聊", "私聊", "私":
+		return chatScopePrivate
+	}
+	return ""
+}
+
+func scopeLabel(scope string) string {
+	switch scope {
+	case chatScopeGroup:
+		return "仅群聊"
+	case chatScopePrivate:
+		return "仅私聊"
+	default:
+		return "私聊+群聊"
+	}
+}
+
+// isControlCommand reports whether text is a command rather than chat: either one
+// this adapter handles itself or one the engine dispatches. Anything else,
+// including "/" text the engine does not recognize, is ordinary chat and is
+// subject to the reply throttle.
+func isControlCommand(text string) bool {
+	return isCommand(text, "/scope") || isCommand(text, "/persona") || core.IsBuiltinCommand(text)
+}
+
+// isCommand reports whether text invokes the given command, either bare or
+// followed by a space-separated argument.
+func isCommand(text, command string) bool {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, command) {
+		return false
+	}
+	rest := text[len(command):]
+	return rest == "" || rest[0] == ' '
+}
+
+// rawTextOf extracts text segments only, without downloading attachments, so the
+// chat-scope gate can inspect a message cheaply.
+func rawTextOf(payload map[string]any) string {
+	var b strings.Builder
+	switch msg := payload["message"].(type) {
+	case []any:
+		for _, seg := range msg {
+			s, ok := seg.(map[string]any)
+			if !ok || s["type"] != "text" {
+				continue
+			}
+			if data, ok := s["data"].(map[string]any); ok {
+				if t, ok := data["text"].(string); ok {
+					b.WriteString(t)
+				}
+			}
+		}
+	default:
+		if raw, ok := payload["raw_message"].(string); ok {
+			b.WriteString(stripCQCodes(raw))
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// ── Chat scope persistence ──────────────────────
+
+type chatScopeState struct {
+	ChatScope string `json:"chat_scope"`
+}
+
+// chatScopeStatePath returns where the /scope override is stored, or "" when the
+// data dir and project name were not injected (e.g. in unit tests).
+func chatScopeStatePath(opts map[string]any) string {
+	dataDir := strings.TrimSpace(toString(opts["cc_data_dir"]))
+	project := strings.TrimSpace(toString(opts["cc_project"]))
+	if dataDir == "" || project == "" {
+		return ""
+	}
+	return filepath.Join(dataDir, "qq", sanitizePathPart(project), "chat_scope.json")
+}
+
+func loadChatScope(path string) string {
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("qq: read chat scope state failed", "path", path, "error", err)
+		}
+		return ""
+	}
+	var state chatScopeState
+	if err := json.Unmarshal(data, &state); err != nil {
+		slog.Warn("qq: parse chat scope state failed", "path", path, "error", err)
+		return ""
+	}
+	return parseChatScope(state.ChatScope)
+}
+
+func saveChatScope(path, scope string) error {
+	data, err := json.MarshalIndent(chatScopeState{ChatScope: scope}, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+// sanitizePathPart keeps letters, digits and a few punctuation marks so project
+// names (including non-ASCII ones) map to a safe single path segment.
+func sanitizePathPart(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case unicode.IsLetter(r), unicode.IsDigit(r), r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "default"
+	}
+	return b.String()
+}
+
 // ── Helpers ──
 
 type replyContext struct {
@@ -1320,6 +1741,7 @@ type replyContext struct {
 	userID      int64
 	groupID     int64
 	messageID   int32
+	persona     string // current persona tag for TTS
 }
 
 func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
@@ -1329,13 +1751,14 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 		return nil, fmt.Errorf("qq: invalid session key %q", sessionKey)
 	}
 	if len(parts) == 3 {
+		persona := p.personaFor(sessionKey)
 		if parts[1] == "g" {
 			gid, _ := strconv.ParseInt(parts[2], 10, 64)
-			return &replyContext{messageType: "group", groupID: gid}, nil
+			return &replyContext{messageType: "group", groupID: gid, persona: persona}, nil
 		}
 		gid, _ := strconv.ParseInt(parts[1], 10, 64)
 		uid, _ := strconv.ParseInt(parts[2], 10, 64)
-		return &replyContext{messageType: "group", groupID: gid, userID: uid}, nil
+		return &replyContext{messageType: "group", groupID: gid, userID: uid, persona: persona}, nil
 	}
 	uid, _ := strconv.ParseInt(parts[1], 10, 64)
 	return &replyContext{messageType: "private", userID: uid}, nil
@@ -1410,26 +1833,34 @@ func (p *Platform) isBotMentioned(payload map[string]any) bool {
 	return false
 }
 
-// isPermissionApproval checks if the text is a permission approval keyword.
-func isPermissionApproval(text string) bool {
-	s := strings.ToLower(strings.TrimSpace(text))
-	for _, w := range []string{
-		"允许", "允许所有", "允许全部", "全部允许", "所有允许", "都允许", "全部同意",
-		"同意", "可以", "好", "好的", "是", "确认",
-		"allow", "allow all", "allowall", "approve", "approve all", "yes", "yes all", "y", "ok",
-	} {
-		if s == w {
-			return true
-		}
-	}
-	return false
-}
-
 func toString(v any) string {
 	if s, ok := v.(string); ok {
 		return s
 	}
 	return ""
+}
+
+// optInt reads an integer option. TOML decodes integers as int64, while tests
+// and programmatic callers use int, so both must be accepted.
+func optInt(opts map[string]any, key string) int {
+	switch v := opts[key].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	}
+	return 0
+}
+
+// optIntOr reads an integer option, falling back to def only when the key is
+// absent, so an explicit 0 is preserved.
+func optIntOr(opts map[string]any, key string, def int) int {
+	if _, ok := opts[key]; !ok {
+		return def
+	}
+	return optInt(opts, key)
 }
 
 func toInt64(v any) (int64, bool) {

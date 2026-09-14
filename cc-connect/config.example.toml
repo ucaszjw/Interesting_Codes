@@ -1415,6 +1415,51 @@ app_secret = "your-feishu-app-secret"
 # allow_from = "*"                 # allowed QQ user IDs, e.g. "12345,67890" or "*" for all
 #                                  # 允许的 QQ 号，如 "12345,67890"，"*" 表示所有
 # share_session_in_channel = false  # If true, all users in a group share one agent session / 群聊共享会话
+#
+# Voice replies / 语音回复
+# Voice synthesis itself is configured in the top-level [tts] section; the options
+# below only tune what the QQ adapter does with it. Requires ffmpeg.
+# 语音合成本身由顶层 [tts] 配置；以下选项只控制 QQ 适配器的行为。需要安装 ffmpeg。
+#
+# persona_voices: map a persona tag (see /persona) to a voice name understood by the
+#                 configured [tts] provider. Personas not listed use [tts] voice.
+#                 把人设标签映射到 [tts] provider 认识的音色名；未列出的人设使用 [tts] voice。
+# voice_probability: percentage chance that an otherwise eligible reply is also sent as
+#                    voice, so a group does not get spoken word for every message.
+#                    0 = no thinning (tts_mode decides alone). A reply to a voice message
+#                    is always spoken.
+#                    回复有百分之多少的概率额外发一条语音，避免群里每条消息都变成语音。
+#                    0 = 不做概率过滤（完全由 tts_mode 决定）。回复语音消息时始终用语音。
+#
+# persona_voices = { "猫娘" = "zh-CN-XiaoyiNeural", "文豪" = "zh-CN-YunxiNeural" }
+# voice_probability = 20
+#
+# chat_scope: which chats the bot answers in. "all" (default) | "group" | "private".
+#             Switch at runtime with the admin-only /scope command (requires admin_ids),
+#             e.g. /scope group. A runtime switch is stored under the data dir and wins
+#             over this value on the next start.
+#             机器人只在哪些会话里回复。all（默认）| group 仅群聊 | private 仅私聊。
+#             可用管理员专用的 /scope 命令在线切换（需配置 admin_ids），如 /scope group。
+#             在线切换会存到数据目录，重启后优先于这里的配置值。
+#             Private chats never get voice replies (text only).
+#             私聊永远只发文字，不发语音。
+# chat_scope = "all"
+#
+# How chatty the bot is in groups / 群聊里的说话频率
+# Being @-mentioned always gets an answer. For messages that do NOT address the bot,
+# reply_probability is rolled each time, with these adjustments:
+# 被 @ 时必定回复。未被 @ 的消息才掷骰子，并受下面几项影响：
+#   reply_skip_penalty  each ignored message lowers the chance / 每被无视一条，概率下降
+#   reply_cold_boost    every 10s of silence after the last reply raises it by this much
+#                       上次回复后每静默 10 秒，概率回升这么多（默认 5 涨得太快）
+#   reply_prob_min/max  clamp the final chance / 概率上下限（上限决定了天花板）
+#   reply_cooldown      minimum seconds between replies to non-@ messages; @ is unaffected
+#                       非 @ 消息两条回复之间的最小间隔秒数；@ 不受影响。0 = 关闭
+# reply_probability = 10
+# reply_prob_max = 15
+# reply_cold_boost = 1
+# reply_skip_penalty = 3
+# reply_cooldown = 60
 
 # QQ Bot (Official / 官方 QQ 机器人) (uncomment to enable / 取消注释以启用)
 # Uses the official QQ Bot Platform API — no third-party adapter needed.

@@ -12,6 +12,10 @@ cc-connect.bak-*
 *.out
 *.old
 
+# Local ASR/TTS model weights (Whisper .bin, Piper .onnx) — download, don't commit
+*.onnx
+*.onnx.json
+
 # ============================================================================
 # Go workspace & tooling
 # ============================================================================

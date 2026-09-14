@@ -5890,9 +5890,9 @@ func (s *controllableAgentSession) Close() error {
 
 // controllableAgent lets tests control which session is returned by StartSession.
 type controllableAgent struct {
-	nextSession     AgentSession
-	listFn          func() ([]AgentSessionInfo, error)
-	startSessionFn  func(ctx context.Context, sessionID string) (AgentSession, error)
+	nextSession    AgentSession
+	listFn         func() ([]AgentSessionInfo, error)
+	startSessionFn func(ctx context.Context, sessionID string) (AgentSession, error)
 }
 
 func (a *controllableAgent) Name() string { return "controllable" }
@@ -13137,4 +13137,386 @@ func TestMaybeAutoResetSessionOnIdle_NotFiredWhenUserActivityRecent(t *testing.T
 	if rotated != nil {
 		t.Fatal("expected no idle reset because LastUserActivity is only 5min ago")
 	}
+}
+
+// --- TTS pipeline stubs ---
+
+// recordingTTS captures what the engine asked the provider to synthesize.
+type recordingTTS struct {
+	mu     sync.Mutex
+	text   string
+	voice  string
+	err    error
+	format string
+}
+
+func (r *recordingTTS) Synthesize(_ context.Context, text string, opts TTSSynthesisOpts) ([]byte, string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.text = text
+	r.voice = opts.Voice
+	if r.err != nil {
+		return nil, "", r.err
+	}
+	format := r.format
+	if format == "" {
+		format = "mp3"
+	}
+	return []byte("audio-bytes"), format, nil
+}
+
+func (r *recordingTTS) snapshot() (text, voice string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.text, r.voice
+}
+
+// audioOnlyPlatform can receive synthesized audio but has no VoiceSelector or
+// VoiceGate, exercising the fallback paths.
+type audioOnlyPlatform struct {
+	stubPlatformEngine
+	mu     sync.Mutex
+	audio  []byte
+	format string
+}
+
+func (p *audioOnlyPlatform) SendAudio(_ context.Context, _ any, audio []byte, format string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.audio = audio
+	p.format = format
+	return nil
+}
+
+func (p *audioOnlyPlatform) sentAudio() ([]byte, string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.audio, p.format
+}
+
+// gatedVoicePlatform adds per-persona voice selection and a probability gate.
+type gatedVoicePlatform struct {
+	audioOnlyPlatform
+	voice     string
+	allow     bool
+	gateCalls int
+	gateText  string
+	gateVoice bool
+}
+
+func (p *gatedVoicePlatform) SelectVoice(any) string { return p.voice }
+
+func (p *gatedVoicePlatform) AllowVoice(_ any, text string, fromVoice bool) bool {
+	p.gateCalls++
+	p.gateText = text
+	p.gateVoice = fromVoice
+	return p.allow
+}
+
+func newTTSEngine(t *testing.T, provider TextToSpeech) *Engine {
+	t.Helper()
+	e := &Engine{ctx: context.Background()}
+	if provider != nil {
+		e.SetTTSConfig(&TTSCfg{Enabled: true, Voice: "global-voice", TTS: provider})
+	}
+	return e
+}
+
+func TestTTSAllowed_ModeGating(t *testing.T) {
+	p := &audioOnlyPlatform{}
+
+	if (&Engine{ctx: context.Background()}).ttsAllowed(p, nil, "hi", false) {
+		t.Error("ttsAllowed = true without TTS configured")
+	}
+
+	e := newTTSEngine(t, &recordingTTS{})
+	e.tts.SetTTSMode("voice_only")
+	if e.ttsAllowed(p, nil, "hi", true) != true {
+		t.Error("voice_only should speak when the turn came from voice")
+	}
+	if e.ttsAllowed(p, nil, "hi", false) != false {
+		t.Error("voice_only should stay silent for text turns")
+	}
+
+	e.tts.SetTTSMode("always")
+	if !e.ttsAllowed(p, nil, "hi", false) {
+		t.Error("always should speak for text turns")
+	}
+
+	e.tts.Enabled = false
+	if e.ttsAllowed(p, nil, "hi", true) {
+		t.Error("ttsAllowed = true when TTS is disabled")
+	}
+}
+
+func TestTTSAllowed_VoiceGateCanVeto(t *testing.T) {
+	provider := &recordingTTS{}
+	e := newTTSEngine(t, provider)
+	e.tts.SetTTSMode("always")
+
+	p := &gatedVoicePlatform{allow: false}
+	if e.ttsAllowed(p, nil, "hello", false) {
+		t.Error("VoiceGate veto should suppress TTS")
+	}
+	if p.gateCalls != 1 {
+		t.Errorf("gateCalls = %d, want 1", p.gateCalls)
+	}
+	if p.gateText != "hello" || p.gateVoice {
+		t.Errorf("gate got text=%q fromVoice=%v, want %q/false", p.gateText, p.gateVoice, "hello")
+	}
+
+	p.allow = true
+	if !e.ttsAllowed(p, nil, "hello", false) {
+		t.Error("VoiceGate approval should allow TTS")
+	}
+}
+
+func TestTTSAllowed_VoiceGateNotConsultedWhenModeRefuses(t *testing.T) {
+	e := newTTSEngine(t, &recordingTTS{})
+	e.tts.SetTTSMode("voice_only")
+
+	p := &gatedVoicePlatform{allow: true}
+	if e.ttsAllowed(p, nil, "hello", false) {
+		t.Error("voice_only + text turn should be silent")
+	}
+	if p.gateCalls != 0 {
+		t.Errorf("gateCalls = %d, want 0 (mode already refused)", p.gateCalls)
+	}
+}
+
+func TestSendTTSReply_UsesVoiceSelector(t *testing.T) {
+	provider := &recordingTTS{}
+	e := newTTSEngine(t, provider)
+
+	p := &gatedVoicePlatform{voice: "persona-voice"}
+	e.sendTTSReply(p, nil, "你好")
+
+	if _, voice := provider.snapshot(); voice != "persona-voice" {
+		t.Errorf("synthesized voice = %q, want %q", voice, "persona-voice")
+	}
+	audio, format := p.sentAudio()
+	if string(audio) != "audio-bytes" || format != "mp3" {
+		t.Errorf("SendAudio got audio=%q format=%q", audio, format)
+	}
+}
+
+func TestSendTTSReply_FallsBackToGlobalVoice(t *testing.T) {
+	provider := &recordingTTS{}
+	e := newTTSEngine(t, provider)
+
+	// No VoiceSelector on this platform.
+	p := &audioOnlyPlatform{}
+	e.sendTTSReply(p, nil, "你好")
+
+	if _, voice := provider.snapshot(); voice != "global-voice" {
+		t.Errorf("synthesized voice = %q, want global fallback %q", voice, "global-voice")
+	}
+
+	// Selector present but returns empty.
+	g := &gatedVoicePlatform{voice: ""}
+	e.sendTTSReply(g, nil, "你好")
+	if _, voice := provider.snapshot(); voice != "global-voice" {
+		t.Errorf("empty SelectVoice should fall back, got %q", voice)
+	}
+}
+
+func TestSendTTSReply_StripsMarkdownBeforeSynthesis(t *testing.T) {
+	provider := &recordingTTS{}
+	e := newTTSEngine(t, provider)
+	p := &audioOnlyPlatform{}
+
+	e.sendTTSReply(p, nil, "**粗体** 和 `代码`")
+
+	text, _ := provider.snapshot()
+	if strings.Contains(text, "**") || strings.Contains(text, "`") {
+		t.Errorf("markdown was not stripped before synthesis: %q", text)
+	}
+}
+
+func TestSendTTSReply_HonorsMaxTextLen(t *testing.T) {
+	provider := &recordingTTS{}
+	e := newTTSEngine(t, provider)
+	e.tts.MaxTextLen = 5
+	p := &audioOnlyPlatform{}
+
+	e.sendTTSReply(p, nil, "这段文字明显超过五个字了")
+
+	if text, _ := provider.snapshot(); text != "" {
+		t.Errorf("synthesis ran despite exceeding max_text_len: %q", text)
+	}
+	if audio, _ := p.sentAudio(); audio != nil {
+		t.Error("audio was sent despite exceeding max_text_len")
+	}
+}
+
+func TestSendTTSReply_PlatformWithoutAudioSender(t *testing.T) {
+	provider := &recordingTTS{}
+	e := newTTSEngine(t, provider)
+
+	// stubPlatformEngine implements neither AudioSender nor the voice interfaces;
+	// this must be a graceful no-op rather than a panic.
+	e.sendTTSReply(&stubPlatformEngine{n: "stub"}, nil, "你好")
+
+	if text, _ := provider.snapshot(); text == "" {
+		t.Error("expected synthesis to be attempted before the capability check")
+	}
+}
+
+func TestSendTTSReply_SynthesisFailureIsNotFatal(t *testing.T) {
+	provider := &recordingTTS{err: errors.New("boom")}
+	e := newTTSEngine(t, provider)
+	p := &audioOnlyPlatform{}
+
+	e.sendTTSReply(p, nil, "你好")
+
+	if audio, _ := p.sentAudio(); audio != nil {
+		t.Error("no audio should be sent when synthesis fails")
+	}
+}
+
+func TestIsBuiltinCommand(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want bool
+	}{
+		{"/new", true},
+		{"/new extra args", true},
+		{"/NEW", true},
+		{"/ne", true}, // unique prefix of "new"
+		{"/help", true},
+		{"/list", true},
+		{"/s", false},     // ambiguous prefix (switch/status/stop/...)
+		{"/n", false},     // ambiguous prefix (new/name)
+		{"/simp", false},  // not a built-in: reaches the agent as chat
+		{"/scope", false}, // adapter-owned, not a core command
+		{"new", false},    // no leading slash
+		{"", false},
+		{"   ", false},
+		{"hello /new", false}, // not at the start
+	} {
+		if got := IsBuiltinCommand(tc.raw); got != tc.want {
+			t.Errorf("IsBuiltinCommand(%q) = %v, want %v", tc.raw, got, tc.want)
+		}
+	}
+}
+
+// TestHandlePendingPermission_NoPendingIsPlainChat is the regression test for a
+// bug where a non-admin's ordinary "好的" was rejected with an admin-only
+// refusal. Deciding whether text is an approval is only valid while a request is
+// actually pending; with nothing pending the message must fall through as chat.
+func TestHandlePendingPermission_NoPendingIsPlainChat(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "test"}
+
+	msg := &Message{
+		SessionKey:              "test:chat:user1",
+		UserID:                  "user1",
+		Content:                 "好的",
+		ReplyCtx:                "ctx",
+		BlockPermissionApproval: true,
+	}
+	if e.handlePendingPermission(p, msg, "好的", "") {
+		t.Fatal("with no pending request the message must not be consumed")
+	}
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("a plain \"好的\" produced a reply: %v", sent)
+	}
+}
+
+func TestHandlePendingPermission_NonAdminCannotApprove(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "test"}
+	rec := &recordingAgentSession{}
+
+	state := &interactiveState{
+		agentSession: rec,
+		platform:     p,
+		replyCtx:     "ctx",
+		pending: &pendingPermission{
+			RequestID: "req-1",
+			ToolName:  "Bash",
+			ToolInput: map[string]any{"command": "ls"},
+			Resolved:  make(chan struct{}),
+		},
+	}
+	const key = "test:chat:user1"
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	handled := e.handlePendingPermission(p, &Message{
+		SessionKey:              key,
+		UserID:                  "nonadmin",
+		Content:                 "好的",
+		ReplyCtx:                "ctx",
+		BlockPermissionApproval: true,
+	}, "好的", "")
+
+	if !handled {
+		t.Fatal("expected the approval attempt to be consumed")
+	}
+	if rec.calls != 0 {
+		t.Fatalf("a blocked sender authorized tool use: %d RespondPermission call(s)", rec.calls)
+	}
+	if sent := p.getSent(); len(sent) != 1 || !containsAny(sent[0], "admin", "管理员", "管理員", "管理者") {
+		t.Fatalf("expected an admin-only refusal, got %v", sent)
+	}
+	state.mu.Lock()
+	stillPending := state.pending != nil
+	state.mu.Unlock()
+	if !stillPending {
+		t.Fatal("a refused approval must leave the request pending so an admin can answer")
+	}
+
+	// The admin can still approve afterwards.
+	p.clearSent()
+	if !e.handlePendingPermission(p, &Message{
+		SessionKey: key, UserID: "admin", Content: "允许", ReplyCtx: "ctx",
+	}, "允许", "") {
+		t.Fatal("admin approval should be consumed")
+	}
+	if rec.calls != 1 {
+		t.Fatalf("admin approval did not reach the agent session: calls=%d", rec.calls)
+	}
+}
+
+func TestHandlePendingPermission_NonAdminMayStillDeny(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "test"}
+	rec := &recordingAgentSession{}
+
+	state := &interactiveState{
+		agentSession: rec,
+		platform:     p,
+		replyCtx:     "ctx",
+		pending: &pendingPermission{
+			RequestID: "req-1",
+			ToolName:  "Bash",
+			ToolInput: map[string]any{"command": "ls"},
+			Resolved:  make(chan struct{}),
+		},
+	}
+	const key = "test:chat:user1"
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	if !e.handlePendingPermission(p, &Message{
+		SessionKey: key, UserID: "nonadmin", Content: "拒绝", ReplyCtx: "ctx",
+		BlockPermissionApproval: true,
+	}, "拒绝", "") {
+		t.Fatal("a denial should still be handled")
+	}
+	if rec.calls != 1 || rec.lastResult.Behavior != "deny" {
+		t.Fatalf("expected a deny response, got calls=%d behavior=%q", rec.calls, rec.lastResult.Behavior)
+	}
+}
+
+func containsAny(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }

@@ -63,6 +63,22 @@ type AudioSender interface {
 	SendAudio(ctx context.Context, replyCtx any, audio []byte, format string) error
 }
 
+// VoiceSelector is an optional capability for platforms that pick the TTS voice
+// per conversation, e.g. a distinct voice for each group persona. A non-empty
+// return value overrides TTSCfg.Voice for that reply.
+type VoiceSelector interface {
+	SelectVoice(replyCtx any) string
+}
+
+// VoiceGate is an optional capability for platforms that need to decide per
+// reply whether the voice message should actually be sent, after the engine's
+// tts_mode check has already accepted the reply. Use it for platform-specific
+// policy such as a per-group probability. Returning false suppresses TTS for
+// that reply only; the text reply is unaffected.
+type VoiceGate interface {
+	AllowVoice(replyCtx any, text string, fromVoice bool) bool
+}
+
 // ──────────────────────────────────────────────────────────────
 // QwenTTS — Alibaba DashScope TTS implementation
 // ──────────────────────────────────────────────────────────────
@@ -293,9 +309,9 @@ func (m *MiniMaxTTS) Synthesize(ctx context.Context, text string, opts TTSSynthe
 	}
 
 	reqBody := map[string]any{
-		"model":        m.Model,
-		"text":         text,
-		"stream":       true,
+		"model":  m.Model,
+		"text":   text,
+		"stream": true,
 		"voice_setting": map[string]any{
 			"voice_id": voice,
 			"speed":    speed,

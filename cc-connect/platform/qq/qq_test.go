@@ -1,10 +1,14 @@
 package qq
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -86,6 +90,277 @@ func TestNew_ShareSessionInChannel(t *testing.T) {
 // verify Platform implements core.Platform
 var _ core.Platform = (*Platform)(nil)
 
+// TestNew_NumericOptionsAcceptTOMLInt64 guards against silently ignoring every
+// numeric option. config.toml is decoded into map[string]any by BurntSushi/toml,
+// which yields int64, whereas Go callers pass int.
+func TestNew_NumericOptionsAcceptTOMLInt64(t *testing.T) {
+	p, err := New(map[string]any{
+		"reply_probability":  int64(7),
+		"reply_skip_penalty": int64(2),
+		"reply_cold_boost":   int64(9),
+		"reply_prob_min":     int64(3),
+		"reply_prob_max":     int64(11),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	platform := p.(*Platform)
+	for _, tc := range []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"replyProbability", platform.replyProbability, 7},
+		{"replySkipPenalty", platform.replySkipPenalty, 2},
+		{"replyColdBoost", platform.replyColdBoost, 9},
+		{"replyProbMin", platform.replyProbMin, 3},
+		{"replyProbMax", platform.replyProbMax, 11},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %d, want %d", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+// TestNew_ExplicitZeroReplyProbabilityKeepsZero documents that 0 means
+// "probability disabled" and must not be replaced by the default of 30.
+func TestNew_ExplicitZeroReplyProbabilityKeepsZero(t *testing.T) {
+	p, err := New(map[string]any{"reply_probability": int64(0)})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := p.(*Platform).replyProbability; got != 0 {
+		t.Errorf("replyProbability = %d, want 0", got)
+	}
+}
+
+func TestNew_ReplyProbabilityDefaultsWhenAbsent(t *testing.T) {
+	p, err := New(map[string]any{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := p.(*Platform).replyProbability; got != 30 {
+		t.Errorf("replyProbability = %d, want default 30", got)
+	}
+}
+
+func TestNew_VoiceProbability(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts map[string]any
+		want int
+	}{
+		{"from toml int64", map[string]any{"voice_probability": int64(25)}, 25},
+		{"absent is off", map[string]any{}, 0},
+		{"negative clamps to 0", map[string]any{"voice_probability": int64(-5)}, 0},
+		{"above 100 clamps", map[string]any{"voice_probability": int64(150)}, 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := New(tc.opts)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := p.(*Platform).voiceProbability; got != tc.want {
+				t.Errorf("voiceProbability = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNew_PersonaVoices(t *testing.T) {
+	p, err := New(map[string]any{
+		"persona_voices": map[string]any{
+			"猫娘": "zh-CN-XiaoyiNeural",
+			"直男": "",
+			"文豪": "zh-CN-YunxiNeural",
+			"乱码": 42,
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	voices := p.(*Platform).personaVoices
+	if got := voices["猫娘"]; got != "zh-CN-XiaoyiNeural" {
+		t.Errorf("猫娘 voice = %q, want %q", got, "zh-CN-XiaoyiNeural")
+	}
+	if _, ok := voices["直男"]; ok {
+		t.Error("empty voice name should be dropped")
+	}
+	if _, ok := voices["乱码"]; ok {
+		t.Error("non-string voice name should be dropped")
+	}
+	if len(voices) != 2 {
+		t.Errorf("len(personaVoices) = %d, want 2", len(voices))
+	}
+}
+
+func TestSelectVoice(t *testing.T) {
+	p := &Platform{personaVoices: map[string]string{"猫娘": "voice-cat"}}
+
+	if got := p.SelectVoice(&replyContext{persona: "猫娘"}); got != "voice-cat" {
+		t.Errorf("SelectVoice(猫娘) = %q, want %q", got, "voice-cat")
+	}
+	if got := p.SelectVoice(&replyContext{persona: "没有配置的人设"}); got != "" {
+		t.Errorf("unmapped persona should fall back to the global voice, got %q", got)
+	}
+	if got := p.SelectVoice(&replyContext{}); got != "" {
+		t.Errorf("empty persona should return empty, got %q", got)
+	}
+	if got := p.SelectVoice("not a reply context"); got != "" {
+		t.Errorf("unknown reply context should return empty, got %q", got)
+	}
+}
+
+func TestAllowVoice(t *testing.T) {
+	group := &replyContext{messageType: "group"}
+
+	t.Run("private chats never get voice", func(t *testing.T) {
+		p := &Platform{voiceProbability: 100}
+		for _, rctx := range []any{&replyContext{messageType: "private"}, &replyContext{}, nil, "not a ctx"} {
+			if p.AllowVoice(rctx, "", false) {
+				t.Errorf("AllowVoice(%#v) = true, want false for non-group replies", rctx)
+			}
+		}
+	})
+
+	t.Run("no gating when probability is zero", func(t *testing.T) {
+		p := &Platform{voiceProbability: 0}
+		for i := 0; i < 100; i++ {
+			if !p.AllowVoice(group, "", false) {
+				t.Fatal("probability 0 should never gate")
+			}
+		}
+	})
+
+	t.Run("voice reply is never gated", func(t *testing.T) {
+		p := &Platform{voiceProbability: 1}
+		for i := 0; i < 100; i++ {
+			if !p.AllowVoice(group, "", true) {
+				t.Fatal("a reply to a voice message should always be spoken")
+			}
+		}
+	})
+
+	t.Run("probability 100 always allows", func(t *testing.T) {
+		p := &Platform{voiceProbability: 100}
+		for i := 0; i < 100; i++ {
+			if !p.AllowVoice(group, "", false) {
+				t.Fatal("probability 100 should never gate")
+			}
+		}
+	})
+
+	t.Run("probability 50 allows and refuses", func(t *testing.T) {
+		p := &Platform{voiceProbability: 50}
+		allowed, refused := 0, 0
+		for i := 0; i < 1000; i++ {
+			if p.AllowVoice(group, "", false) {
+				allowed++
+			} else {
+				refused++
+			}
+		}
+		if allowed == 0 || refused == 0 {
+			t.Errorf("expected a mix of decisions, got allowed=%d refused=%d", allowed, refused)
+		}
+	})
+}
+
+func TestSendAudio_RejectsInvalidReplyContext(t *testing.T) {
+	p := &Platform{}
+	if err := p.SendAudio(context.Background(), "not a reply context", []byte("x"), "mp3"); err == nil {
+		t.Error("expected an error for an invalid reply context")
+	}
+}
+
+func TestSendAudio_RejectsEmptyAudio(t *testing.T) {
+	p := &Platform{}
+	rctx := &replyContext{messageType: "group", groupID: 1}
+	if err := p.SendAudio(context.Background(), rctx, nil, "mp3"); err == nil {
+		t.Error("expected an error for empty audio")
+	}
+}
+
+func TestParseMessage_ReportsVoiceOrigin(t *testing.T) {
+	p := &Platform{}
+
+	voice := map[string]any{
+		"message": []any{
+			map[string]any{"type": "record", "data": map[string]any{"file": "flag_3s.amr"}},
+		},
+	}
+	text, _, _, fromVoice := p.parseMessage(voice)
+	if !fromVoice {
+		t.Error("fromVoice = false, want true for a record segment")
+	}
+	if text != "[语音 3s]" {
+		t.Errorf("text = %q, want %q", text, "[语音 3s]")
+	}
+
+	textMsg := map[string]any{
+		"message": []any{
+			map[string]any{"type": "text", "data": map[string]any{"text": "hi"}},
+		},
+	}
+	if _, _, _, fromVoice := p.parseMessage(textMsg); fromVoice {
+		t.Error("fromVoice = true, want false for a text message")
+	}
+}
+
+func TestPersonaFor(t *testing.T) {
+	p := &Platform{}
+	if got := p.personaFor("qq:g:1"); got != defaultPersona {
+		t.Errorf("personaFor with no override = %q, want %q", got, defaultPersona)
+	}
+	p.personaMap.Store("qq:g:1", "猫娘")
+	if got := p.personaFor("qq:g:1"); got != "猫娘" {
+		t.Errorf("personaFor = %q, want %q", got, "猫娘")
+	}
+	p.personaMap.Store("qq:g:2", "")
+	if got := p.personaFor("qq:g:2"); got != defaultPersona {
+		t.Errorf("empty override should fall back to %q, got %q", defaultPersona, got)
+	}
+}
+
+func TestReconstructReplyCtx_CarriesPersona(t *testing.T) {
+	p := &Platform{}
+	p.personaMap.Store("qq:g:42", "文豪")
+
+	got, err := p.ReconstructReplyCtx("qq:g:42")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	rctx, ok := got.(*replyContext)
+	if !ok {
+		t.Fatalf("got %T, want *replyContext", got)
+	}
+	if rctx.persona != "文豪" {
+		t.Errorf("persona = %q, want %q", rctx.persona, "文豪")
+	}
+
+	// qq:{groupID}:{userID} form
+	got, err = p.ReconstructReplyCtx("qq:42:7")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	rctx, ok = got.(*replyContext)
+	if !ok {
+		t.Fatalf("got %T, want *replyContext", got)
+	}
+	if rctx.messageType != "group" || rctx.groupID != 42 || rctx.userID != 7 {
+		t.Errorf("unexpected reply context: %+v", rctx)
+	}
+
+	// private form keeps no persona
+	got, err = p.ReconstructReplyCtx("qq:7")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rctx, ok := got.(*replyContext); !ok || rctx.persona != "" {
+		t.Errorf("private reply context should not carry a persona: %+v", rctx)
+	}
+}
+
 // TestStart_FetchesSelfIDWithoutTimeout verifies that Start() completes
 // promptly with selfID populated from the get_login_info OneBot API call.
 // Regression for a bug where Start invoked callAPI BEFORE launching readLoop,
@@ -147,5 +422,699 @@ func TestStart_FetchesSelfIDWithoutTimeout(t *testing.T) {
 
 	if p.selfID != botUserID {
 		t.Errorf("selfID = %d, want %d (self-message filter would be disabled)", p.selfID, botUserID)
+	}
+}
+
+// --- Chat scope ---
+
+const fakeBotUserID = 999999
+
+// fakeOneBot is a minimal OneBot v11 server: it answers the calls the qq adapter
+// makes and records outgoing message params.
+type fakeOneBot struct {
+	ts   *httptest.Server
+	mu   sync.Mutex
+	conn *websocket.Conn
+	sent []map[string]any
+
+	// gorilla/websocket permits only one concurrent writer, and both the server
+	// handler (API responses) and the test (incoming events) write to this conn.
+	writeMu sync.Mutex
+}
+
+func (f *fakeOneBot) write(c *websocket.Conn, msg []byte) error {
+	f.writeMu.Lock()
+	defer f.writeMu.Unlock()
+	return c.WriteMessage(websocket.TextMessage, msg)
+}
+
+func newFakeOneBot(t *testing.T) *fakeOneBot {
+	t.Helper()
+	f := &fakeOneBot{}
+	upgrader := websocket.Upgrader{}
+	f.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		f.mu.Lock()
+		f.conn = c
+		f.mu.Unlock()
+		defer c.Close()
+
+		for {
+			_, msg, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			var req map[string]any
+			if json.Unmarshal(msg, &req) != nil {
+				continue
+			}
+			var data map[string]any
+			switch req["action"] {
+			case "get_login_info":
+				data = map[string]any{"user_id": fakeBotUserID, "nickname": "TestBot"}
+			case "get_group_info":
+				data = map[string]any{"group_name": "测试群"}
+			default:
+				if params, ok := req["params"].(map[string]any); ok {
+					f.mu.Lock()
+					f.sent = append(f.sent, params)
+					f.mu.Unlock()
+				}
+			}
+			resp, _ := json.Marshal(map[string]any{
+				"status": "ok", "retcode": 0, "echo": req["echo"], "data": data,
+			})
+			if err := f.write(c, resp); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(f.ts.Close)
+	return f
+}
+
+func (f *fakeOneBot) url() string { return "ws" + strings.TrimPrefix(f.ts.URL, "http") }
+
+func (f *fakeOneBot) sendEvent(t *testing.T, event map[string]any) {
+	t.Helper()
+	f.mu.Lock()
+	c := f.conn
+	f.mu.Unlock()
+	if c == nil {
+		t.Fatal("fake OneBot has no client connection")
+	}
+	raw, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	if err := f.write(c, raw); err != nil {
+		t.Fatalf("send event: %v", err)
+	}
+}
+
+func (f *fakeOneBot) sentTexts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.sent))
+	for _, p := range f.sent {
+		if s, ok := p["message"].(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (f *fakeOneBot) waitForText(t *testing.T, substr string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, s := range f.sentTexts() {
+			if strings.Contains(s, substr) {
+				return s
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no outgoing message containing %q within %s; sent=%v", substr, timeout, f.sentTexts())
+	return ""
+}
+
+// startQQ boots a Platform against a fake OneBot server.
+func startQQ(t *testing.T, opts map[string]any, handler core.MessageHandler) (*Platform, *fakeOneBot) {
+	t.Helper()
+	f := newFakeOneBot(t)
+	opts["ws_url"] = f.url()
+	p, err := New(opts)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	plat := p.(*Platform)
+	if err := plat.Start(handler); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = plat.Stop() })
+	return plat, f
+}
+
+func textEvent(msgType string, userID int64, text string) map[string]any {
+	event := map[string]any{
+		"post_type":    "message",
+		"message_type": msgType,
+		"user_id":      userID,
+		"message_id":   time.Now().UnixNano(),
+		"message": []any{
+			map[string]any{"type": "text", "data": map[string]any{"text": text}},
+		},
+	}
+	if msgType == "group" {
+		event["group_id"] = int64(100)
+	}
+	return event
+}
+
+func TestParseChatScope(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"all", chatScopeAll},
+		{"ALL", chatScopeAll},
+		{"全部", chatScopeAll},
+		{"group", chatScopeGroup},
+		{"群聊", chatScopeGroup},
+		{"private", chatScopePrivate},
+		{"私聊", chatScopePrivate},
+		{" private ", chatScopePrivate},
+		{"garbage", ""},
+		{"", ""},
+	} {
+		if got := parseChatScope(tc.in); got != tc.want {
+			t.Errorf("parseChatScope(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestIsCommand(t *testing.T) {
+	for _, tc := range []struct {
+		text string
+		want bool
+	}{
+		{"/scope", true},
+		{"/scope group", true},
+		{"/scopex", false},
+		{"/persona", false},
+		{"hey /scope", false},
+		{"", false},
+	} {
+		if got := isCommand(tc.text, "/scope"); got != tc.want {
+			t.Errorf("isCommand(%q, /scope) = %v, want %v", tc.text, got, tc.want)
+		}
+	}
+}
+
+func TestScopeAllows(t *testing.T) {
+	for _, tc := range []struct {
+		scope   string
+		msgType string
+		want    bool
+	}{
+		{chatScopeAll, "group", true},
+		{chatScopeAll, "private", true},
+		{chatScopeGroup, "group", true},
+		{chatScopeGroup, "private", false},
+		{chatScopePrivate, "private", true},
+		{chatScopePrivate, "group", false},
+	} {
+		p := &Platform{chatScope: tc.scope}
+		if got := p.scopeAllows(tc.msgType); got != tc.want {
+			t.Errorf("scope=%s msgType=%s: scopeAllows = %v, want %v", tc.scope, tc.msgType, got, tc.want)
+		}
+	}
+}
+
+func TestScopeBlocks_LetsScopeCommandThrough(t *testing.T) {
+	p := &Platform{chatScope: chatScopePrivate}
+
+	if !p.scopeBlocks("group", "你好") {
+		t.Error("plain group message should be blocked when scope is private")
+	}
+	if p.scopeBlocks("group", "/scope group") {
+		t.Error("/scope must pass through so an admin can switch back")
+	}
+	if p.scopeBlocks("private", "你好") {
+		t.Error("in-scope message should not be blocked")
+	}
+	if p.scopeBlocks("group", " /scope all") {
+		t.Error("leading whitespace should still count as the command")
+	}
+}
+
+func TestRawTextOf(t *testing.T) {
+	payload := map[string]any{
+		"message": []any{
+			map[string]any{"type": "image", "data": map[string]any{"url": "http://example.invalid/x.png"}},
+			map[string]any{"type": "text", "data": map[string]any{"text": "/scope group"}},
+		},
+	}
+	if got := rawTextOf(payload); got != "/scope group" {
+		t.Errorf("rawTextOf = %q, want %q", got, "/scope group")
+	}
+
+	raw := map[string]any{"raw_message": "[CQ:at,qq=1] hi"}
+	if got := rawTextOf(raw); got != "hi" {
+		t.Errorf("rawTextOf(raw_message) = %q, want %q", got, "hi")
+	}
+}
+
+func TestNew_ChatScope(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts map[string]any
+		want string
+	}{
+		{"absent defaults to all", map[string]any{}, chatScopeAll},
+		{"invalid falls back to all", map[string]any{"chat_scope": "nonsense"}, chatScopeAll},
+		{"group", map[string]any{"chat_scope": "group"}, chatScopeGroup},
+		{"chinese alias", map[string]any{"chat_scope": "私聊"}, chatScopePrivate},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := New(tc.opts)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := p.(*Platform).currentScope(); got != tc.want {
+				t.Errorf("currentScope = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestChatScope_PersistenceRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	opts := map[string]any{"cc_data_dir": dir, "cc_project": "my-proj"}
+
+	if got := chatScopeStatePath(opts); !strings.HasSuffix(got, filepath.Join("qq", "my-proj", "chat_scope.json")) {
+		t.Errorf("unexpected state path: %q", got)
+	}
+
+	if err := saveChatScope(chatScopeStatePath(opts), chatScopeGroup); err != nil {
+		t.Fatalf("saveChatScope: %v", err)
+	}
+	if got := loadChatScope(chatScopeStatePath(opts)); got != chatScopeGroup {
+		t.Errorf("loadChatScope = %q, want %q", got, chatScopeGroup)
+	}
+}
+
+// TestNew_PersistedScopeWinsOverConfig documents that a /scope switch is sticky:
+// the stored value beats the config default on the next start.
+func TestNew_PersistedScopeWinsOverConfig(t *testing.T) {
+	dir := t.TempDir()
+	opts := map[string]any{"cc_data_dir": dir, "cc_project": "proj"}
+	if err := saveChatScope(chatScopeStatePath(opts), chatScopePrivate); err != nil {
+		t.Fatalf("saveChatScope: %v", err)
+	}
+
+	p, err := New(map[string]any{
+		"chat_scope":  "group",
+		"cc_data_dir": dir,
+		"cc_project":  "proj",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := p.(*Platform).currentScope(); got != chatScopePrivate {
+		t.Errorf("currentScope = %q, want persisted %q", got, chatScopePrivate)
+	}
+}
+
+func TestChatScopeStatePath_EmptyWithoutInjection(t *testing.T) {
+	if got := chatScopeStatePath(map[string]any{}); got != "" {
+		t.Errorf("chatScopeStatePath = %q, want empty when data dir/project are missing", got)
+	}
+}
+
+func TestSanitizePathPart(t *testing.T) {
+	if got := sanitizePathPart("a/b:c"); got != "a_b_c" {
+		t.Errorf("sanitizePathPart = %q, want %q", got, "a_b_c")
+	}
+	if got := sanitizePathPart("项目一"); got != "项目一" {
+		t.Errorf("sanitizePathPart should keep non-ASCII letters, got %q", got)
+	}
+	if got := sanitizePathPart(""); got != "default" {
+		t.Errorf("sanitizePathPart(\"\") = %q, want %q", got, "default")
+	}
+}
+
+func TestHandleMessage_DropsOutOfScopeChats(t *testing.T) {
+	got := make(chan *core.Message, 4)
+	_, f := startQQ(t, map[string]any{"chat_scope": "private"}, func(_ core.Platform, m *core.Message) {
+		got <- m
+	})
+
+	f.sendEvent(t, textEvent("group", 200, "你好"))
+
+	select {
+	case m := <-got:
+		t.Fatalf("handler was called for an out-of-scope group message: %+v", m)
+	case <-time.After(400 * time.Millisecond):
+	}
+}
+
+func TestHandleMessage_DeliversInScopeChats(t *testing.T) {
+	got := make(chan *core.Message, 4)
+	_, f := startQQ(t, map[string]any{
+		"chat_scope":        "private",
+		"reply_probability": 0,
+	}, func(_ core.Platform, m *core.Message) {
+		got <- m
+	})
+
+	f.sendEvent(t, textEvent("private", 200, "你好"))
+
+	select {
+	case m := <-got:
+		if m.Content != "你好" {
+			t.Errorf("Content = %q, want %q", m.Content, "你好")
+		}
+		if m.FromVoice {
+			t.Error("FromVoice = true for a text message")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler was not called for an in-scope private message")
+	}
+}
+
+func TestScopeCommand_AdminOnly(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"chat_scope": "all",
+		"admin_ids":  "200",
+	}, func(core.Platform, *core.Message) {})
+
+	f.sendEvent(t, textEvent("group", 300, "/scope group"))
+	f.waitForText(t, "只有管理员", 3*time.Second)
+
+	if got := plat.currentScope(); got != chatScopeAll {
+		t.Errorf("scope changed to %q by a non-admin", got)
+	}
+}
+
+func TestScopeCommand_WithoutAdminIDsExplainsItself(t *testing.T) {
+	_, f := startQQ(t, map[string]any{"chat_scope": "all"}, func(core.Platform, *core.Message) {})
+
+	f.sendEvent(t, textEvent("group", 300, "/scope group"))
+	f.waitForText(t, "admin_ids", 3*time.Second)
+}
+
+func TestScopeCommand_SwitchesAndPersists(t *testing.T) {
+	dir := t.TempDir()
+	plat, f := startQQ(t, map[string]any{
+		"chat_scope":  "all",
+		"admin_ids":   "200",
+		"cc_data_dir": dir,
+		"cc_project":  "proj",
+	}, func(core.Platform, *core.Message) {})
+
+	f.sendEvent(t, textEvent("group", 200, "/scope 私聊"))
+	f.waitForText(t, "✅", 3*time.Second)
+
+	if got := plat.currentScope(); got != chatScopePrivate {
+		t.Errorf("currentScope = %q, want %q", got, chatScopePrivate)
+	}
+	if got := loadChatScope(chatScopeStatePath(map[string]any{"cc_data_dir": dir, "cc_project": "proj"})); got != chatScopePrivate {
+		t.Errorf("persisted scope = %q, want %q", got, chatScopePrivate)
+	}
+}
+
+func TestScopeCommand_ShowsCurrentOnNoArgs(t *testing.T) {
+	_, f := startQQ(t, map[string]any{
+		"chat_scope": "group",
+		"admin_ids":  "200",
+	}, func(core.Platform, *core.Message) {})
+
+	f.sendEvent(t, textEvent("group", 200, "/scope"))
+	f.waitForText(t, "仅群聊", 3*time.Second)
+}
+
+func TestScopeCommand_RejectsInvalidArg(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"chat_scope": "all",
+		"admin_ids":  "200",
+	}, func(core.Platform, *core.Message) {})
+
+	f.sendEvent(t, textEvent("group", 200, "/scope nonsense"))
+	f.waitForText(t, "参数无效", 3*time.Second)
+
+	if got := plat.currentScope(); got != chatScopeAll {
+		t.Errorf("currentScope = %q, want unchanged %q", got, chatScopeAll)
+	}
+}
+
+// TestScopeCommand_WorksFromOutOfScopeChat is the lockout guard: with scope set
+// to private, an admin must still be able to switch back from a group.
+func TestScopeCommand_WorksFromOutOfScopeChat(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"chat_scope": "private",
+		"admin_ids":  "200",
+	}, func(core.Platform, *core.Message) {})
+
+	f.sendEvent(t, textEvent("group", 200, "/scope all"))
+	f.waitForText(t, "✅", 3*time.Second)
+
+	if got := plat.currentScope(); got != chatScopeAll {
+		t.Errorf("currentScope = %q, want %q", got, chatScopeAll)
+	}
+}
+
+// TestHandlerReplyDoesNotStallReadLoop is a regression test for a self-deadlock.
+// A handler issuing an API call can only have its response routed by readLoop, so
+// handling events inline on the read loop made the reply wait out callAPI's full
+// 15s timeout — and the socket was deaf for those 15 seconds. Two commands sent
+// back to back must both be answered promptly; the second reply is the signal,
+// since the first one's send is observable on the wire even while it is stuck.
+func TestHandlerReplyDoesNotStallReadLoop(t *testing.T) {
+	_, f := startQQ(t, map[string]any{
+		"chat_scope": "all",
+		"admin_ids":  "200",
+	}, func(core.Platform, *core.Message) {})
+
+	f.sendEvent(t, textEvent("group", 200, "/scope private"))
+	f.sendEvent(t, textEvent("group", 200, "/scope"))
+
+	if !waitUntil(func() bool { return len(f.sentTexts()) >= 2 }, 3*time.Second) {
+		t.Fatalf("expected two replies promptly, got %v", f.sentTexts())
+	}
+}
+
+func waitUntil(pred func() bool, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if pred() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+func TestIsControlCommand(t *testing.T) {
+	for _, tc := range []struct {
+		text string
+		want bool
+	}{
+		{"/scope", true},
+		{"/scope group", true},
+		{"/persona", true},
+		{"/persona simp", true},
+		{"/new", true}, // core built-in
+		{"/help", true},
+		{"/tts always", true},
+		{"/simp", false}, // looks like a command, is chat
+		{"/list", true},
+		{"你好", false},
+		{"", false},
+		{"/scopeish", false},
+	} {
+		if got := isControlCommand(tc.text); got != tc.want {
+			t.Errorf("isControlCommand(%q) = %v, want %v", tc.text, got, tc.want)
+		}
+	}
+}
+
+func TestShouldReply_CooldownQuietsAmbientReplies(t *testing.T) {
+	p := &Platform{
+		replyProbability: 100, // without a cooldown this always replies
+		replySkipPenalty: 1,
+		replyColdBoost:   0,
+		replyProbMin:     1,
+		replyProbMax:     100,
+		replyCooldown:    60,
+	}
+
+	// First ambient message: no prior reply, so the cooldown cannot apply.
+	// The text is deliberately longer than two runes and asks no question, so the
+	// content modifiers do not interfere.
+	if !p.shouldReply("qq:g:1", "今天天气不错") {
+		t.Fatal("first message should not be suppressed by the cooldown")
+	}
+
+	// Immediately after replying, ambient messages are suppressed.
+	if p.shouldReply("qq:g:1", "再聊一句") {
+		t.Error("message within the cooldown window should be suppressed")
+	}
+
+	// Backdate the last reply past the cooldown: replies are allowed again.
+	p.replyStateMap.Store("qq:g:1", &replyState{lastReplyTime: time.Now().Add(-2 * time.Minute)})
+	if !p.shouldReply("qq:g:1", "过了一分钟") {
+		t.Error("message after the cooldown window should be allowed")
+	}
+}
+
+func TestShouldReply_CooldownDisabledByDefault(t *testing.T) {
+	p := &Platform{replyProbability: 100, replySkipPenalty: 1, replyProbMin: 1, replyProbMax: 100}
+	for i := 0; i < 5; i++ {
+		if !p.shouldReply("qq:g:1", "今天天气不错") {
+			t.Fatal("replyCooldown 0 should disable the cooldown entirely")
+		}
+	}
+}
+
+// TestAtMentionLeavesReplyStateUntouched pins the contract that being addressed
+// directly answers 100% of the time yet neither spends nor resets the ambient
+// reply budget, so @ traffic does not change how chatty the bot is otherwise.
+func TestAtMentionLeavesReplyStateUntouched(t *testing.T) {
+	got := make(chan *core.Message, 4)
+	plat, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+		"reply_cooldown":           3600, // would silence any ambient message
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+
+	last := time.Now().Add(-10 * time.Minute).Truncate(time.Second)
+	plat.replyStateMap.Store("qq:g:100", &replyState{skipCount: 5, lastReplyTime: last})
+
+	f.sendEvent(t, map[string]any{
+		"post_type":    "message",
+		"message_type": "group",
+		"group_id":     int64(100),
+		"user_id":      int64(200),
+		"message_id":   int64(1),
+		"message": []any{
+			map[string]any{"type": "at", "data": map[string]any{"qq": strconv.Itoa(fakeBotUserID)}},
+			map[string]any{"type": "text", "data": map[string]any{"text": " 在吗"}},
+		},
+	})
+
+	select {
+	case <-got: // @-mention is delivered despite the long cooldown
+	case <-time.After(3 * time.Second):
+		t.Fatal("@-mention was not delivered; it must not be throttled")
+	}
+
+	raw, ok := plat.replyStateMap.Load("qq:g:100")
+	if !ok {
+		t.Fatal("reply state disappeared")
+	}
+	rs := raw.(*replyState)
+	if rs.skipCount != 5 {
+		t.Errorf("skipCount = %d, want 5 untouched by an @-mention", rs.skipCount)
+	}
+	if !rs.lastReplyTime.Equal(last) {
+		t.Errorf("lastReplyTime = %v, want untouched %v", rs.lastReplyTime, last)
+	}
+}
+
+// TestCommandSurvivesBufferFlush is a regression test: the backlog used to
+// replace the current message's text, so the engine (which dispatches commands by
+// a leading "/") turned e.g. /new into ordinary chat whenever a backlog existed.
+func TestCommandSurvivesBufferFlush(t *testing.T) {
+	got := make(chan string, 8)
+	plat, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+		"reply_cooldown":           3600, // keep ambient messages buffered, never replied to
+		"reply_probability":        100,
+	}, func(_ core.Platform, m *core.Message) { got <- m.Content })
+
+	// Pretend the bot just spoke, so the cooldown suppresses the next two messages
+	// and they pile up in the buffer instead of being flushed.
+	plat.replyStateMap.Store("qq:g:100", &replyState{lastReplyTime: time.Now()})
+
+	f.sendEvent(t, textEvent("group", 200, "随便聊聊"))
+	f.sendEvent(t, textEvent("group", 200, "再聊一句"))
+	f.sendEvent(t, textEvent("group", 200, "/new"))
+
+	select {
+	case content := <-got:
+		if content != "/new" {
+			t.Errorf("handler saw %q, want the command %q (backlog must not replace it)", content, "/new")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("command never reached the handler")
+	}
+}
+
+// TestOrdinaryApprovalWordsAreChat is a regression test. A non-admin saying
+// "好的" in a group used to be treated as an attempt to approve a tool permission
+// request and bounced with "❌ 只有管理员才能批准操作，你一边呆着去。" — even though
+// no permission was pending. Deciding that is the engine's job, since only it
+// knows whether a request is actually waiting.
+func TestOrdinaryApprovalWordsAreChat(t *testing.T) {
+	got := make(chan *core.Message, 8)
+	_, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+		"tool_admin_only":          true,
+		"admin_ids":                "999",
+		"reply_probability":        0, // no dice: every message reaches the handler
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+
+	for _, text := range []string{"好的", "好", "可以", "ok", "确认", "是"} {
+		f.sendEvent(t, textEvent("group", 200, text))
+	}
+
+	deadline := time.After(3 * time.Second)
+	for i := 0; i < 6; i++ {
+		select {
+		case <-got:
+		case <-deadline:
+			t.Fatalf("only %d of 6 approval-like messages reached the handler as chat", i)
+		}
+	}
+
+	for _, sent := range f.sentTexts() {
+		if strings.Contains(sent, "只有管理员才能批准操作") {
+			t.Fatalf("a plain chat message was rejected as an unauthorized approval: %q", sent)
+		}
+	}
+}
+
+// TestMessageCarriesPermissionApprovalBlock checks the adapter only labels who may
+// not authorize tool use; the engine enforces it while a request is pending.
+func TestMessageCarriesPermissionApprovalBlock(t *testing.T) {
+	got := make(chan *core.Message, 4)
+	_, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+		"tool_admin_only":          true,
+		"admin_ids":                "2232095290",
+		"reply_probability":        0, // reach the handler regardless of the dice
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+
+	f.sendEvent(t, textEvent("group", 2232095290, "你好")) // admin
+	f.sendEvent(t, textEvent("group", 300000001, "在吗"))  // non-admin
+
+	next := func() *core.Message {
+		select {
+		case m := <-got:
+			return m
+		case <-time.After(3 * time.Second):
+			t.Fatal("message never reached the handler")
+			return nil
+		}
+	}
+
+	if m := next(); m.BlockPermissionApproval {
+		t.Error("admin message should be allowed to authorize tool use")
+	}
+	if m := next(); !m.BlockPermissionApproval {
+		t.Error("non-admin message must not be allowed to authorize tool use")
+	}
+}
+
+// TestAdminCanApproveWithoutToolAdminOnly covers the flag being off entirely.
+func TestNoApprovalBlockWhenToolAdminOnlyDisabled(t *testing.T) {
+	got := make(chan *core.Message, 4)
+	_, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+		"tool_admin_only":          false,
+		"admin_ids":                "2232095290",
+		"reply_probability":        0,
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+
+	f.sendEvent(t, textEvent("group", 300000001, "你好"))
+
+	select {
+	case m := <-got:
+		if m.BlockPermissionApproval {
+			t.Error("no approval block should apply when tool_admin_only is off")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("message never reached the handler")
 	}
 }

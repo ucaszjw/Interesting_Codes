@@ -630,7 +630,6 @@ func (e *Engine) SetSkipGit(skipGit bool) {
 	e.skipGit = skipGit
 }
 
-
 // SetInjectSender controls whether sender identity (platform and user ID) is
 // prepended to each message before forwarding it to the agent. When enabled,
 // the agent receives a preamble line like:
@@ -2460,6 +2459,17 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 
 	lower := strings.ToLower(strings.TrimSpace(content))
 
+	// A platform may restrict who is allowed to authorize tool use (e.g. a
+	// non-admin in a shared group session). This is evaluated only here, where a
+	// request is genuinely pending, so an ordinary "好的" in chat is never mistaken
+	// for an approval attempt. Denials still go through: refusing a tool is safe.
+	if msg.BlockPermissionApproval && (isApproveAllResponse(lower) || isAllowResponse(lower)) {
+		slog.Info("permission approval refused: sender is not an approver",
+			"user_id", msg.UserID, "session", msg.SessionKey, "tool", pending.ToolName)
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPermissionAdminOnly))
+		return true
+	}
+
 	if isApproveAllResponse(lower) {
 		state.mu.Lock()
 		state.approveAll = true
@@ -3647,7 +3657,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.markStopped()
 			gracePeriod := 10 * time.Second
 			graceTimer := time.NewTimer(gracePeriod)
-			graceLoop:
+		graceLoop:
 			for {
 				select {
 				case evt, ok := <-state.agentSession.Events():
@@ -4369,17 +4379,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 			// TTS: async voice reply if enabled (skipped for silent replies)
-			if !isSilent && e.tts != nil && e.tts.Enabled && e.tts.TTS != nil {
-				state.mu.Lock()
-				fromVoice := state.fromVoice
-				state.mu.Unlock()
-				mode := e.tts.GetTTSMode()
-				slog.Debug("tts: checking conditions", "mode", mode, "fromVoice", fromVoice, "will_send", mode == "always" || (mode == "voice_only" && fromVoice))
-				if mode == "always" || (mode == "voice_only" && fromVoice) {
-					go e.sendTTSReply(p, replyCtx, fullResponse)
-				}
-			} else {
-				slog.Debug("tts: not enabled", "tts_nil", e.tts == nil, "enabled", e.tts != nil && e.tts.Enabled, "tts_obj_nil", e.tts == nil || e.tts.TTS == nil)
+			state.mu.Lock()
+			fromVoice := state.fromVoice
+			state.mu.Unlock()
+			if !isSilent && e.ttsAllowed(p, replyCtx, fullResponse, fromVoice) {
+				go e.sendTTSReply(p, replyCtx, fullResponse)
 			}
 
 			// Auto-compress after finishing a turn, before sending any queued messages.
@@ -4863,6 +4867,20 @@ func matchPrefix(prefix string, candidates []struct {
 		}
 	}
 	return matched
+}
+
+// IsBuiltinCommand reports whether raw names a built-in command, i.e. the engine
+// handles it in handleCommand instead of forwarding it to the agent. It mirrors
+// handleCommand's own resolution, so platforms can tell control messages apart
+// from ordinary chat: unrecognized "/" text is chatted about by the agent like
+// any other message.
+func IsBuiltinCommand(raw string) bool {
+	parts := strings.Fields(raw)
+	if len(parts) == 0 || !strings.HasPrefix(parts[0], "/") {
+		return false
+	}
+	cmd := strings.ToLower(strings.TrimPrefix(parts[0], "/"))
+	return matchPrefix(cmd, builtinCommands) != ""
 }
 
 // matchSubCommand does prefix matching against a flat list of subcommand names.
@@ -12878,6 +12896,27 @@ func splitMessage(text string, maxLen int) []string {
 	return chunks
 }
 
+// ttsAllowed reports whether a voice reply should be sent for the current turn.
+// It applies tts_mode first, then lets a platform veto via VoiceGate.
+func (e *Engine) ttsAllowed(p Platform, replyCtx any, text string, fromVoice bool) bool {
+	if e.tts == nil || !e.tts.Enabled || e.tts.TTS == nil {
+		slog.Debug("tts: not enabled",
+			"tts_nil", e.tts == nil,
+			"enabled", e.tts != nil && e.tts.Enabled,
+			"provider_nil", e.tts == nil || e.tts.TTS == nil)
+		return false
+	}
+	mode := e.tts.GetTTSMode()
+	allowed := mode == "always" || (mode == "voice_only" && fromVoice)
+	if allowed {
+		if vg, ok := p.(VoiceGate); ok && !vg.AllowVoice(replyCtx, text, fromVoice) {
+			allowed = false
+		}
+	}
+	slog.Debug("tts: checking conditions", "mode", mode, "fromVoice", fromVoice, "will_send", allowed)
+	return allowed
+}
+
 // sendTTSReply synthesizes fullResponse text and sends audio to the platform.
 // Called asynchronously after EventResult; text reply is always sent first.
 func (e *Engine) sendTTSReply(p Platform, replyCtx any, text string) {
@@ -12894,8 +12933,14 @@ func (e *Engine) sendTTSReply(p Platform, replyCtx any, text string) {
 		slog.Warn("tts: text exceeds max_text_len, skipping synthesis", "len", utf8.RuneCountInString(text), "max", e.tts.MaxTextLen)
 		return
 	}
-	slog.Info("tts: starting synthesis", "voice", e.tts.Voice, "text_len", len(text))
-	opts := TTSSynthesisOpts{Voice: e.tts.Voice}
+	voice := e.tts.Voice
+	if vs, ok := p.(VoiceSelector); ok {
+		if v := vs.SelectVoice(replyCtx); v != "" {
+			voice = v
+		}
+	}
+	slog.Info("tts: starting synthesis", "voice", voice, "text_len", len(text))
+	opts := TTSSynthesisOpts{Voice: voice}
 	audioData, format, err := e.tts.TTS.Synthesize(e.ctx, StripMarkdown(text), opts)
 	if err != nil {
 		slog.Error("tts: synthesis failed", "error", err)

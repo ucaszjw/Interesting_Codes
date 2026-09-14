@@ -189,6 +189,7 @@ const (
 	MsgPermissionApproveAll      MsgKey = "permission_approve_all"
 	MsgPermissionDenied          MsgKey = "permission_denied_msg"
 	MsgPermissionHint            MsgKey = "permission_hint"
+	MsgPermissionAdminOnly       MsgKey = "permission_admin_only"
 	MsgQuietOn                   MsgKey = "quiet_on"
 	MsgQuietOff                  MsgKey = "quiet_off"
 	MsgDisplayModeCompact        MsgKey = "display_mode_compact"
@@ -833,6 +834,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "⚠️ 等待權限回應。請回覆 **允許** / **拒絕** / **允許所有**。",
 		LangJapanese:           "⚠️ 権限の応答を待っています。**allow** / **deny** / **allow all** で返信してください。",
 		LangSpanish:            "⚠️ Esperando respuesta de permiso. Responda **allow** / **deny** / **allow all**.",
+	},
+	MsgPermissionAdminOnly: {
+		LangEnglish:            "❌ Only an admin can authorize tool use here — ask the admin to reply.",
+		LangChinese:            "❌ 只有管理员才能批准这次操作，请让管理员来回复。",
+		LangTraditionalChinese: "❌ 只有管理員才能批准這次操作，請讓管理員來回覆。",
+		LangJapanese:           "❌ この操作を許可できるのは管理者だけです。管理者に返信を依頼してください。",
+		LangSpanish:            "❌ Solo un administrador puede autorizar el uso de herramientas. Pídele al administrador que responda.",
 	},
 	MsgQuietOn: {
 		LangEnglish:            "🔇 Quiet mode ON — thinking and tool progress messages will be hidden.",
