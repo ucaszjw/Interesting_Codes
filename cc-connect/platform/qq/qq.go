@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -108,7 +109,23 @@ type Platform struct {
 	// loop so API calls issued from a handler (the /scope and /persona replies)
 	// can still have their responses routed, which readLoop is responsible for.
 	msgQueue chan map[string]any
+
+	// QQ CDN rkeys cached per chat kind ("group"/"private"). The rkey inside a
+	// message event's image url can already be stale, so downloads are rebuilt
+	// with a fresh one from get_rkey.
+	rkeyMu  sync.Mutex
+	rkeyMap map[string]rkeyEntry
 }
+
+// rkeyEntry is a cached CDN rkey with the time it was fetched.
+type rkeyEntry struct {
+	value     string
+	fetchedAt time.Time
+}
+
+// rkeyRefreshInterval is how long a cached rkey is reused. QQ hands out rkeys with
+// a ttl of around an hour; refreshing well inside that keeps a margin.
+const rkeyRefreshInterval = 20 * time.Minute
 
 // msgQueueSize bounds how many events may wait behind a slow handler.
 const msgQueueSize = 64
@@ -120,10 +137,65 @@ const (
 	chatScopePrivate = "private" // answer in private chats only
 )
 
-// cronJobConfig defines a scheduled prompt sent to the AI for dynamic message generation.
+// personaCommands is the single source of truth for /persona: each persona tag
+// with the aliases that select it, in the order shown to users. Personas must also
+// be described in the prompt file (CLAUDE.md) for the agent to know how to play
+// them — TestPersonaCommandsCoverPrompt guards that the two stay in step.
+var personaCommands = []struct {
+	persona string
+	aliases []string
+}{
+	{"贴吧老哥", []string{"tieba", "老哥"}},
+	{"猫娘", []string{"neko", "catgirl"}},
+	{"老干部", []string{"cadre", "老干"}},
+	{"母狗", []string{"simp"}},
+	{"萌妹", []string{"cute"}},
+	{"捧哏", []string{"penggen"}},
+	{"直男", []string{"straight"}},
+	{"魅魔", []string{"succubus"}},
+	{"女拳", []string{"feminist"}},
+	{"赛博道士", []string{"taoist", "道士"}},
+	{"弱智吧吧友", []string{"ruozhi", "弱智"}},
+	{"资本家", []string{"capitalist"}},
+	{"营销号", []string{"marketing"}},
+	{"复读机", []string{"repeater"}},
+	{"文豪", []string{"poet"}},
+	{"理中客", []string{"reasonable"}},
+	{"甲方", []string{"client"}},
+	{"中二病", []string{"chuuni", "中二"}},
+	{"男朋友", []string{"bf", "boyfriend"}},
+	{"女朋友", []string{"gf", "girlfriend"}},
+	{"群友", []string{"qunyou", "群u"}},
+}
+
+// validPersonas resolves a /persona argument (or a persona tag itself) to its tag.
+var validPersonas = func() map[string]string {
+	m := make(map[string]string, 2*len(personaCommands))
+	for _, c := range personaCommands {
+		m[c.persona] = c.persona
+		for _, a := range c.aliases {
+			m[a] = c.persona
+		}
+	}
+	return m
+}()
+
+// personaListText renders the available personas for the /persona help reply.
+func personaListText() string {
+	parts := make([]string, 0, len(personaCommands))
+	for _, c := range personaCommands {
+		parts = append(parts, c.persona+"/"+strings.Join(c.aliases, "/"))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// cronJobConfig defines a scheduled group action. A job either asks the agent to
+// compose something (prompt) or sends fixed text verbatim (message).
 type cronJobConfig struct {
 	Cron    string `json:"cron"`
 	Prompt  string `json:"prompt"`
+	Message string `json:"message"` // literal text, sent without the agent
+	At      int64  `json:"at"`      // optional QQ to @-mention before Message
 	GroupID int64  `json:"group_id"`
 }
 
@@ -216,10 +288,15 @@ func New(opts map[string]any) (core.Platform, error) {
 			if m, ok := r.(map[string]any); ok {
 				cron := toString(m["cron"])
 				prompt := toString(m["prompt"])
+				message := toString(m["message"])
+				at, _ := toInt64(m["at"])
 				gid, _ := toInt64(m["group_id"])
-				if cron != "" && prompt != "" && gid != 0 {
-					cronJobs = append(cronJobs, cronJobConfig{Cron: cron, Prompt: prompt, GroupID: gid})
+				if cron == "" || gid == 0 || (prompt == "" && message == "") {
+					continue
 				}
+				cronJobs = append(cronJobs, cronJobConfig{
+					Cron: cron, Prompt: prompt, Message: message, At: at, GroupID: gid,
+				})
 			}
 		}
 	}
@@ -475,8 +552,15 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		sessionKey = fmt.Sprintf("qq:%d", userID)
 	}
 
-	// Buffer: accumulate group messages for full context between AI replies
-	if msgType == "group" {
+	// Control messages are answered unconditionally and are never throttled, so
+	// admin workflows stay responsive. Only recognized commands count: treating
+	// any "/" prefix as a command let "/anything" bypass the throttle.
+	control := isControlCommand(text)
+
+	// Buffer: accumulate group messages for full context between AI replies.
+	// Commands are left out — the engine acts on them directly, so replaying
+	// "/new" or "/persona x" as conversation context is only noise.
+	if msgType == "group" && !control {
 		p.addToBuffer(sessionKey, userName, userID, text)
 	}
 
@@ -531,64 +615,51 @@ func (p *Platform) handleMessage(payload map[string]any) {
 	// Handle /persona command (persona switching)
 	if msgType == "group" && isCommand(text, "/persona") {
 		name := strings.TrimSpace(text[len("/persona"):])
-		validPersonas := map[string]string{
-			"tieba": "贴吧老哥", "老哥": "贴吧老哥",
-			"neko": "猫娘", "catgirl": "猫娘",
-			"cadre": "老干部", "老干": "老干部",
-			"simp": "母狗", "母狗": "母狗",
-			"cute": "萌妹", "萌妹": "萌妹",
-			"straight": "直男", "直男": "直男",
-			"succubus": "魅魔", "魅魔": "魅魔",
-			"feminist": "女拳", "女拳": "女拳",
-			"taoist": "赛博道士", "道士": "赛博道士",
-			"ruozhi": "弱智吧吧友", "弱智": "弱智吧吧友",
-			"capitalist": "资本家", "资本家": "资本家",
-			"marketing": "营销号", "营销号": "营销号",
-			"repeater": "复读机", "复读机": "复读机",
-			"poet": "文豪", "文豪": "文豪",
-			"reasonable": "理中客", "理中客": "理中客",
-		}
-		if name == "" {
-			available := "贴吧老哥/tieba, 猫娘/neko, 老干部/cadre, 母狗/simp, 萌妹/cute, 直男/straight, 魅魔/succubus, 女拳/feminist, 赛博道士/taoist, 弱智吧吧友/ruozhi, 资本家/capitalist, 营销号/marketing, 复读机/repeater, 文豪/poet, 理中客/reasonable"
-			p.Reply(context.Background(), rctx, "可用人设: "+available)
+		if name == "" || validPersonas[name] == "" {
+			p.Reply(context.Background(), rctx, "可用人设: "+personaListText())
 			return
 		}
-		if mapped, ok := validPersonas[name]; ok {
-			p.personaMap.Store(sessionKey, mapped)
-			// Auto /new to reset session with new persona
-			newMsg := &core.Message{
-				SessionKey:   sessionKey,
-				Platform:     "qq",
-				MessageID:    fmt.Sprintf("persona_%d", time.Now().UnixMilli()),
-				UserID:       strconv.FormatInt(userID, 10),
-				UserName:     userName,
-				Content:      "/new",
-				ExtraContent: extraContent,
-				ReplyCtx:     rctx,
-			}
-			p.handler(p, newMsg)
-		} else {
-			available := "贴吧老哥/tieba, 猫娘/neko, 老干部/cadre, 母狗/simp, 萌妹/cute, 直男/straight, 魅魔/succubus, 女拳/feminist, 赛博道士/taoist, 弱智吧吧友/ruozhi, 资本家/capitalist, 营销号/marketing, 复读机/repeater, 文豪/poet, 理中客/reasonable"
-			p.Reply(context.Background(), rctx, "可用人设: "+available)
+		mapped := validPersonas[name]
+		p.personaMap.Store(sessionKey, mapped)
+		// Auto /new to reset session with new persona
+		newMsg := &core.Message{
+			SessionKey:   sessionKey,
+			Platform:     "qq",
+			MessageID:    fmt.Sprintf("persona_%d", time.Now().UnixMilli()),
+			UserID:       strconv.FormatInt(userID, 10),
+			UserName:     userName,
+			Content:      "/new",
+			ExtraContent: extraContent,
+			ReplyCtx:     rctx,
 		}
+		p.handler(p, newMsg)
 		return
 	}
-	// Control messages are answered unconditionally and are never throttled, so
-	// admin workflows stay responsive. Only recognized commands count: treating
-	// any "/" prefix as a command let "/anything" bypass the throttle.
-	control := isControlCommand(text)
-
-	// Probability-based reply: skip unless probability triggers or the bot was
-	// addressed directly. Being @-mentioned answers 100% of the time and leaves
-	// the probability state untouched, so it neither spends nor resets the
-	// ambient reply budget.
-	if msgType == "group" && !control && !p.isBotMentioned(payload) && audio == nil && p.replyProbability > 0 {
-		if !p.shouldReply(sessionKey, text) {
+	// Throttling for group messages that did not address the bot. Being
+	// @-mentioned answers 100% of the time and leaves this state untouched, so a
+	// direct question neither spends nor resets the ambient reply budget.
+	if msgType == "group" && !control && !p.isBotMentioned(payload) && p.replyProbability > 0 {
+		if len(images) > 0 || audio != nil {
+			// Attachments never roll the dice: a dropped picture or recording is
+			// gone for good, since the backlog holds text only. They do observe the
+			// cooldown, and answering one restarts it — otherwise the cooldown would
+			// barely bite here, because its clock is otherwise only advanced by dice
+			// replies, which are the rare case.
+			rs := p.replyStateFor(sessionKey)
+			now := time.Now()
+			if p.inCooldown(rs, now) {
+				rs.skipCount++
+				slog.Info("qq: skip, cooldown", "session", sessionKey, "kind", "attachment")
+				return
+			}
+			rs.lastReplyTime = now
+		} else if !p.shouldReply(sessionKey, text) {
 			// shouldReply already logged whether it was the cooldown or the dice.
 			slog.Info("qq: skip, throttle", "session", sessionKey, "text", truncateText(text, 20))
 			return
+		} else {
+			shortReply = true
 		}
-		shortReply = true
 	}
 
 	// When replying, flush buffered messages as context. Commands keep their own
@@ -763,17 +834,19 @@ func (p *Platform) parseMessage(payload map[string]any) (string, []core.ImageAtt
 					textParts = append(textParts, text)
 				}
 			case "image":
-				if url, ok := data["url"].(string); ok && url != "" {
-					imgData, mime, err := downloadFile(url)
-					if err != nil {
-						slog.Warn("qq: download image failed", "error", err)
-						continue
-					}
-					images = append(images, core.ImageAttachment{
-						MimeType: mime,
-						Data:     imgData,
-					})
+				// Mark the position so the prompt says an image was attached, the
+				// same way voice messages contribute "[语音 3s]". Without it an
+				// image-only message has no text at all and the agent is left
+				// guessing why it received an attachment.
+				textParts = append(textParts, "[图片]")
+				img, ok := p.fetchImage(data, chatKind(payload))
+				if !ok {
+					// Say so explicitly rather than leaving a bare "[图片]" next to a
+					// missing attachment, which invites the agent to invent an excuse.
+					textParts[len(textParts)-1] = "[图片(加载失败)]"
+					continue
 				}
+				images = append(images, img)
 			case "record":
 				fromVoice = true
 				var keys []string
@@ -984,6 +1057,20 @@ func (p *Platform) resolveGroupName(groupID int64) string {
 // ── OneBot API call via WebSocket ───────────────────────────────
 
 func (p *Platform) callAPI(action string, params map[string]any) (map[string]any, error) {
+	raw, err := p.callAPIRaw(action, params)
+	if err != nil {
+		return nil, err
+	}
+	// Some actions answer with an array (get_rkey); callers that only expect an
+	// object get a nil map rather than an error.
+	var result map[string]any
+	_ = json.Unmarshal(raw, &result)
+	return result, nil
+}
+
+// callAPIRaw performs the request and returns the raw "data" field, whatever its
+// JSON shape.
+func (p *Platform) callAPIRaw(action string, params map[string]any) (json.RawMessage, error) {
 	seq := p.echoSeq.Add(1)
 	echo := strconv.FormatInt(seq, 10)
 
@@ -1005,7 +1092,12 @@ func (p *Platform) callAPI(action string, params map[string]any) (map[string]any
 	}
 
 	p.mu.Lock()
-	err = p.conn.WriteMessage(websocket.TextMessage, data)
+	conn := p.conn
+	if conn == nil {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("qq: %s: not connected", action)
+	}
+	err = conn.WriteMessage(websocket.TextMessage, data)
 	p.mu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("qq: ws write: %w", err)
@@ -1024,9 +1116,7 @@ func (p *Platform) callAPI(action string, params map[string]any) (map[string]any
 		if resp.RetCode != 0 {
 			return nil, fmt.Errorf("qq: API %s failed (retcode=%d)", action, resp.RetCode)
 		}
-		var result map[string]any
-		_ = json.Unmarshal(resp.Data, &result)
-		return result, nil
+		return resp.Data, nil
 
 	case <-time.After(15 * time.Second):
 		return nil, fmt.Errorf("qq: API %s timeout", action)
@@ -1204,10 +1294,19 @@ func (p *Platform) startCronJobs() {
 		idx := i
 		j := job
 		_, err := p.cronScheduler.AddFunc(j.Cron, func() {
+			if j.Message != "" {
+				p.executeCronMessage(j)
+				return
+			}
 			p.executeCronJob(j.GroupID, j.Prompt, idx)
 		})
 		if err != nil {
 			slog.Error("qq: invalid cron expression", "cron", j.Cron, "error", err)
+			continue
+		}
+		if j.Message != "" {
+			slog.Info("qq: cron message registered",
+				"cron", j.Cron, "group", j.GroupID, "at", j.At, "message", truncateText(j.Message, 40))
 			continue
 		}
 		slog.Info("qq: cron prompt registered", "cron", j.Cron, "group", j.GroupID, "prompt", truncateText(j.Prompt, 40))
@@ -1219,6 +1318,44 @@ func (p *Platform) stopCronJobs() {
 	if p.cronScheduler != nil {
 		p.cronScheduler.Stop()
 	}
+}
+
+// executeCronMessage sends a fixed group message on a schedule, optionally
+// @-mentioning someone first. It deliberately bypasses the agent: jobs like this
+// exist to poke another bot's command (e.g. "@otherbot /签到"), so the text has
+// to go out exactly as configured, and the mention has to be a real at-segment
+// rather than plain text that no bot would recognise.
+func (p *Platform) executeCronMessage(job cronJobConfig) {
+	if !p.scopeAllows("group") {
+		slog.Debug("qq: skipping scheduled message, groups are out of scope", "group", job.GroupID)
+		return
+	}
+	if p.checkMute && p.isMutedInGroup(job.GroupID) {
+		slog.Debug("qq: skipping scheduled message, bot is muted", "group", job.GroupID)
+		return
+	}
+
+	segments := make([]map[string]any, 0, 2)
+	if job.At != 0 {
+		segments = append(segments, map[string]any{
+			"type": "at",
+			"data": map[string]any{"qq": strconv.FormatInt(job.At, 10)},
+		})
+	}
+	segments = append(segments, map[string]any{
+		"type": "text",
+		"data": map[string]any{"text": job.Message},
+	})
+
+	if _, err := p.callAPI("send_group_msg", map[string]any{
+		"group_id": job.GroupID,
+		"message":  segments,
+	}); err != nil {
+		slog.Error("qq: scheduled message failed", "group", job.GroupID, "error", err)
+		return
+	}
+	slog.Info("qq: scheduled message sent",
+		"group", job.GroupID, "at", job.At, "message", truncateText(job.Message, 40))
 }
 
 func (p *Platform) executeCronJob(groupID int64, prompt string, _ int) {
@@ -1305,24 +1442,34 @@ func (p *Platform) flushBuffer(sessionKey string) string {
 
 // ── Reply probability ───────────────────────────
 
-func (p *Platform) shouldReply(sessionKey string, text string) bool {
-	// Load or init state
+// replyStateFor returns the per-session throttling state, creating it on first use.
+func (p *Platform) replyStateFor(sessionKey string) *replyState {
 	raw, _ := p.replyStateMap.LoadOrStore(sessionKey, &replyState{})
-	rs := raw.(*replyState)
+	return raw.(*replyState)
+}
+
+// inCooldown reports whether the bot spoke too recently to speak again here.
+// Only replies to messages that did not address the bot advance the clock, so
+// being @-mentioned is never suppressed.
+func (p *Platform) inCooldown(rs *replyState, now time.Time) bool {
+	return p.replyCooldown > 0 && !rs.lastReplyTime.IsZero() &&
+		now.Sub(rs.lastReplyTime) < time.Duration(p.replyCooldown)*time.Second
+}
+
+func (p *Platform) shouldReply(sessionKey string, text string) bool {
+	rs := p.replyStateFor(sessionKey)
 
 	now := time.Now()
 
 	// Cooldown: stay quiet for a while after speaking so the bot does not weigh in
 	// on every ambient message. Only messages that did not address the bot reach
 	// this point, so a direct @-mention is never suppressed by it.
-	if p.replyCooldown > 0 && !rs.lastReplyTime.IsZero() {
-		if quiet := now.Sub(rs.lastReplyTime); quiet < time.Duration(p.replyCooldown)*time.Second {
-			rs.skipCount++
-			slog.Info("qq: skip, cooldown",
-				"session", sessionKey, "since_last_reply_s", int(quiet.Seconds()),
-				"text", truncateText(text, 20))
-			return false
-		}
+	if p.inCooldown(rs, now) {
+		rs.skipCount++
+		slog.Info("qq: skip, cooldown",
+			"session", sessionKey, "since_last_reply_s", int(now.Sub(rs.lastReplyTime).Seconds()),
+			"text", truncateText(text, 20))
+		return false
 	}
 
 	// Calculate probability
@@ -1931,4 +2078,127 @@ func downloadFile(url string) ([]byte, string, error) {
 		mime = http.DetectContentType(data)
 	}
 	return data, mime, nil
+}
+
+// fetchImage obtains an image segment's bytes.
+//
+// The url in a message event carries a QQ CDN rkey that can already be stale by
+// the time the event arrives — fetching it returns HTTP 400, which is why images
+// used to arrive as a 70-byte {"retcode":-5503007,"retmsg":"download url has
+// expired"} payload. The url is therefore rebuilt with a current rkey first, and
+// the event url is only a fallback.
+func (p *Platform) fetchImage(data map[string]any, chatKind string) (core.ImageAttachment, bool) {
+	file, _ := data["file"].(string)
+	eventURL, _ := data["url"].(string)
+	slog.Debug("qq: image segment", "file", file, "url_len", len(eventURL))
+
+	if rebuilt := p.withFreshRKey(eventURL, chatKind); rebuilt != "" && rebuilt != eventURL {
+		if img, ok := downloadImage(rebuilt); ok {
+			return img, true
+		}
+	}
+	if eventURL != "" {
+		if img, ok := downloadImage(eventURL); ok {
+			return img, true
+		}
+	}
+	return core.ImageAttachment{}, false
+}
+
+// withFreshRKey rebuilds a QQ CDN download url using a currently valid rkey from
+// get_rkey. Returns "" when the url is not a CDN link or no rkey is available.
+func (p *Platform) withFreshRKey(rawURL, chatKind string) string {
+	if rawURL == "" {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	q := u.Query()
+	if q.Get("fileid") == "" {
+		return ""
+	}
+	rkey := p.cdnRKey(chatKind)
+	if rkey == "" {
+		return ""
+	}
+	q.Set("rkey", rkey)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// cdnRKey returns a cached rkey for the given chat kind, refreshing it from
+// get_rkey when it is missing or close to expiry.
+func (p *Platform) cdnRKey(kind string) string {
+	p.rkeyMu.Lock()
+	defer p.rkeyMu.Unlock()
+
+	if p.rkeyMap == nil {
+		p.rkeyMap = map[string]rkeyEntry{}
+	}
+	if e, ok := p.rkeyMap[kind]; ok && e.value != "" && time.Since(e.fetchedAt) < rkeyRefreshInterval {
+		return e.value
+	}
+
+	raw, err := p.callAPIRaw("get_rkey", nil)
+	if err != nil {
+		slog.Warn("qq: get_rkey failed", "error", err)
+		return p.rkeyMap[kind].value
+	}
+	var list []struct {
+		Type string `json:"type"`
+		RKey string `json:"rkey"`
+	}
+	if err := json.Unmarshal(raw, &list); err != nil {
+		slog.Warn("qq: get_rkey: unexpected response", "error", err)
+		return p.rkeyMap[kind].value
+	}
+	now := time.Now()
+	for _, e := range list {
+		if e.Type == "" || e.RKey == "" {
+			continue
+		}
+		// NapCat hands the value back with the query prefix already attached.
+		p.rkeyMap[e.Type] = rkeyEntry{value: strings.TrimPrefix(e.RKey, "&rkey="), fetchedAt: now}
+	}
+	slog.Debug("qq: refreshed CDN rkeys", "kinds", len(list))
+	return p.rkeyMap[kind].value
+}
+
+func downloadImage(url string) (core.ImageAttachment, bool) {
+	data, _, err := downloadFile(url)
+	if err != nil {
+		slog.Warn("qq: image download failed", "error", err)
+		return core.ImageAttachment{}, false
+	}
+	return validateImage(data)
+}
+
+// validateImage rejects anything that is not really an image. QQ serves its
+// errors with HTTP 200 and a JSON body such as
+// {"retcode":-5503007,"retmsg":"download url has expired"}, which would otherwise
+// be handed to the agent as a picture of an error message.
+func validateImage(data []byte) (core.ImageAttachment, bool) {
+	if len(data) == 0 {
+		return core.ImageAttachment{}, false
+	}
+	// Sniff the bytes rather than trusting Content-Type: the error payload may
+	// even be labelled image/png.
+	mime := http.DetectContentType(data)
+	if !strings.HasPrefix(mime, "image/") {
+		slog.Warn("qq: image download returned non-image content",
+			"detected", mime, "bytes", len(data), "body", truncateText(string(data), 120))
+		return core.ImageAttachment{}, false
+	}
+	return core.ImageAttachment{MimeType: mime, Data: data}, true
+}
+
+// chatKind reports whether a payload came from a group, for choosing which CDN
+// rkey applies.
+func chatKind(payload map[string]any) string {
+	if t, _ := payload["message_type"].(string); t == "group" {
+		return "group"
+	}
+	return "private"
 }

@@ -1431,6 +1431,20 @@ app_secret = "your-feishu-app-secret"
 #                    回复有百分之多少的概率额外发一条语音，避免群里每条消息都变成语音。
 #                    0 = 不做概率过滤（完全由 tts_mode 决定）。回复语音消息时始终用语音。
 #
+# Scheduled group messages / 定时群消息
+# cron_jobs entries can either ask the agent to compose something (prompt) or send
+# fixed text verbatim (message, with an optional at = <QQ> to @-mention first).
+# A literal message never reaches the agent, which is what you want when the point
+# is to poke another bot's command — the text must go out exactly as written.
+# cron_jobs 的每一项要么让 AI 生成（prompt），要么原样发送固定文本（message，
+# 可选 at = <QQ> 表示先 @ 谁）。固定消息不经过 AI——当目的是触发别的机器人的
+# 命令时正是如此，文本必须一字不差地发出去。
+#
+# cron_jobs = [
+#   {cron = "0 8 * * *",  message = "/签到",     at = 123456789, group_id = 341353242},
+#   {cron = "0 12 * * *", message = "/今日老婆", at = 123456789, group_id = 341353242},
+#   {cron = "0 0 * * *",  prompt = "发一条深夜emo整活消息", group_id = 341353242},
+# ]
 # persona_voices = { "猫娘" = "zh-CN-XiaoyiNeural", "文豪" = "zh-CN-YunxiNeural" }
 # voice_probability = 20
 #
@@ -1455,6 +1469,11 @@ app_secret = "your-feishu-app-secret"
 #   reply_prob_min/max  clamp the final chance / 概率上下限（上限决定了天花板）
 #   reply_cooldown      minimum seconds between replies to non-@ messages; @ is unaffected
 #                       非 @ 消息两条回复之间的最小间隔秒数；@ 不受影响。0 = 关闭
+#                       Images and voice are never dropped by the dice (a dropped attachment
+#                       cannot be recovered) but they do observe this cooldown, so a burst of
+#                       media does not make the bot chatty.
+#                       图片和语音不掷骰子（丢了的附件找不回来），但同样受这个冷却约束，
+#                       避免一阵猛发图把机器人带得话多。
 # reply_probability = 10
 # reply_prob_max = 15
 # reply_cold_boost = 1

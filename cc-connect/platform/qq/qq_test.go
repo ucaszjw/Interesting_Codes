@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -524,6 +527,14 @@ func (f *fakeOneBot) sentTexts() []string {
 			out = append(out, s)
 		}
 	}
+	return out
+}
+
+func (f *fakeOneBot) sentParams() []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]map[string]any, len(f.sent))
+	copy(out, f.sent)
 	return out
 }
 
@@ -1116,5 +1127,385 @@ func TestNoApprovalBlockWhenToolAdminOnlyDisabled(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("message never reached the handler")
+	}
+}
+
+// TestParseMessage_MarksImages makes sure an image contributes a text marker, the
+// way a voice message contributes "[语音 3s]". Without it an image-only group
+// message reaches the agent with no text at all.
+func TestParseMessage_MarksImages(t *testing.T) {
+	png := []byte("\x89PNG\r\n\x1a\n" + "fake")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(png)
+	}))
+	defer ts.Close()
+
+	p := &Platform{}
+	payload := map[string]any{
+		"message": []any{
+			map[string]any{"type": "image", "data": map[string]any{"url": ts.URL}},
+		},
+	}
+	text, images, _, fromVoice := p.parseMessage(payload)
+
+	if text != "[图片]" {
+		t.Errorf("text = %q, want %q", text, "[图片]")
+	}
+	if len(images) != 1 {
+		t.Fatalf("got %d images, want 1", len(images))
+	}
+	if images[0].MimeType != "image/png" || len(images[0].Data) == 0 {
+		t.Errorf("bad attachment: mime=%q len=%d", images[0].MimeType, len(images[0].Data))
+	}
+	if fromVoice {
+		t.Error("an image is not a voice message")
+	}
+}
+
+// TestImageSkipsDice checks that an image does not need to win the reply dice:
+// a dropped attachment cannot be recovered, because the backlog keeps text only.
+// The dice are pinned to 1% here to make that unambiguous.
+func TestImageSkipsDice(t *testing.T) {
+	got := make(chan *core.Message, 4)
+	_, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+		"reply_probability":        1,
+		"reply_prob_min":           1,
+		"reply_prob_max":           1,
+		"reply_cooldown":           0,
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+
+	sendTestImage(t, f, 100, 200)
+
+	select {
+	case m := <-got:
+		if len(m.Images) != 1 {
+			t.Fatalf("delivered message carries %d images, want 1", len(m.Images))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the image never reached the handler despite the dice being bypassed")
+	}
+}
+
+// TestImageRespectsCooldown pins the other half: images are still held to the
+// cooldown, so a burst of pictures does not make the bot chatty.
+func TestImageRespectsCooldown(t *testing.T) {
+	got := make(chan *core.Message, 4)
+	plat, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+		"reply_probability":        100,
+		"reply_cooldown":           3600,
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+
+	plat.replyStateMap.Store("qq:g:100", &replyState{lastReplyTime: time.Now()})
+
+	sendTestImage(t, f, 100, 200)
+
+	select {
+	case m := <-got:
+		t.Fatalf("image delivered inside the cooldown window: %+v", m)
+	case <-time.After(400 * time.Millisecond):
+	}
+}
+
+// TestImageReplyRestartsCooldown covers the detail that makes the cooldown bite:
+// answering a picture advances the clock too, otherwise the cooldown would only
+// ever be driven by dice replies, which are the rare case.
+func TestImageReplyRestartsCooldown(t *testing.T) {
+	got := make(chan *core.Message, 4)
+	_, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+		"reply_probability":        100,
+		"reply_cooldown":           3600,
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+
+	// No prior reply, so the cooldown cannot apply: this one gets through.
+	sendTestImage(t, f, 100, 200)
+	select {
+	case <-got:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the first image never reached the handler")
+	}
+
+	// ...and it restarted the cooldown, so the next one is dropped.
+	sendTestImage(t, f, 100, 201)
+	select {
+	case m := <-got:
+		t.Fatalf("a second image slipped past the cooldown restarted by the first: %+v", m)
+	case <-time.After(400 * time.Millisecond):
+	}
+}
+
+// sendTestImage pushes an image-only group message whose attachment is fetchable.
+func sendTestImage(t *testing.T, f *fakeOneBot, groupID, userID int64) {
+	t.Helper()
+	img := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("\x89PNG\r\n\x1a\n"))
+	}))
+	t.Cleanup(img.Close)
+
+	f.sendEvent(t, map[string]any{
+		"post_type":    "message",
+		"message_type": "group",
+		"group_id":     groupID,
+		"user_id":      userID,
+		"message_id":   time.Now().UnixNano(),
+		"message": []any{
+			map[string]any{"type": "image", "data": map[string]any{"url": img.URL}},
+		},
+	})
+}
+
+// TestEveryPersonaIsSelectable guards the listing, the aliases and the persona's
+// own name all resolving. "捧哏" used to be described in the prompt but missing
+// from the lookup table, which made it impossible to select.
+func TestEveryPersonaIsSelectable(t *testing.T) {
+	for _, c := range personaCommands {
+		if got := validPersonas[c.persona]; got != c.persona {
+			t.Errorf("persona %q resolves to %q, want itself", c.persona, got)
+		}
+		for _, alias := range c.aliases {
+			if got := validPersonas[alias]; got != c.persona {
+				t.Errorf("alias %q resolves to %q, want %q", alias, got, c.persona)
+			}
+		}
+		if !strings.Contains(personaListText(), c.persona) {
+			t.Errorf("persona %q is missing from the /persona listing", c.persona)
+		}
+	}
+	if validPersonas["没有这个人设"] != "" {
+		t.Error("unknown names must not resolve")
+	}
+}
+
+// TestPersonaCommandsCoverPrompt keeps the adapter and the agent's prompt in step:
+// a persona the adapter can select but the prompt never describes would make the
+// agent improvise, and one described but unselectable is simply dead.
+func TestPersonaCommandsCoverPrompt(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "CLAUDE.md")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("prompt file not available (%v); run from a full checkout to check the pairing", err)
+	}
+	re := regexp.MustCompile("(?m)^`\\[([^]]+)\\]`")
+	found := re.FindAllStringSubmatch(string(raw), -1)
+	if len(found) == 0 {
+		t.Fatalf("no persona blocks found in %s", path)
+	}
+	for _, m := range found {
+		tag := m[1]
+		if validPersonas[tag] != tag {
+			t.Errorf("prompt describes persona %q but /persona cannot select it", tag)
+		}
+	}
+	// ...and the reverse: every selectable persona should be described.
+	described := make(map[string]bool, len(found))
+	for _, m := range found {
+		described[m[1]] = true
+	}
+	for _, c := range personaCommands {
+		if !described[c.persona] {
+			t.Errorf("/persona offers %q but the prompt never describes it", c.persona)
+		}
+	}
+}
+
+func TestPersonaSwitchAppliesToLaterMessages(t *testing.T) {
+	got := make(chan *core.Message, 8)
+	_, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+		"reply_probability":        0,
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+
+	f.sendEvent(t, textEvent("group", 200, "/persona 中二病"))
+	f.sendEvent(t, textEvent("group", 200, "你好"))
+
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case m := <-got:
+			// The text may have been replaced by the buffered backlog, which also
+			// carries the message, so match on the content rather than equality.
+			if !strings.Contains(m.Content, "你好") {
+				continue // the auto /new that the switch triggers
+			}
+			if !strings.Contains(m.ExtraContent, "[中二病]") {
+				t.Fatalf("ExtraContent = %q, want it to carry the switched persona", m.ExtraContent)
+			}
+			return
+		case <-deadline:
+			t.Fatal("the message after /persona never reached the handler")
+		}
+	}
+}
+
+// TestValidateImageRejectsErrorPayload is the regression test for images that were
+// silently replaced by QQ's error body. NapCat hands back HTTP 200 with
+// {"retcode":-5503007,"retmsg":"download url has expired"}, which used to be saved
+// as an "image" and sent to the agent — so the bot truthfully reported that the
+// picture was broken.
+func TestValidateImageRejectsErrorPayload(t *testing.T) {
+	expired := []byte(`{"retcode":-5503007,"retmsg":"download url has expired","retryflag":0}`)
+	if _, ok := validateImage(expired); ok {
+		t.Fatal("an expired-url error payload must not be accepted as an image")
+	}
+	if _, ok := validateImage(nil); ok {
+		t.Fatal("empty data must not be accepted")
+	}
+	if _, ok := validateImage([]byte("<html>403</html>")); ok {
+		t.Fatal("html must not be accepted")
+	}
+
+	png := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 64)...)
+	img, ok := validateImage(png)
+	if !ok {
+		t.Fatal("a real PNG must be accepted")
+	}
+	if img.MimeType != "image/png" {
+		t.Errorf("MimeType = %q, want image/png (sniffed from the bytes)", img.MimeType)
+	}
+}
+
+func TestParseMessage_MarksFailedImageFetch(t *testing.T) {
+	// No url and no file id: the fetch cannot succeed and must say so rather than
+	// leaving a bare "[图片]" that invites the agent to invent an excuse.
+	p := &Platform{}
+	payload := map[string]any{
+		"message": []any{
+			map[string]any{"type": "image", "data": map[string]any{"file": "x.jpg"}},
+		},
+	}
+	text, images, _, _ := p.parseMessage(payload)
+	if text != "[图片(加载失败)]" {
+		t.Errorf("text = %q, want %q", text, "[图片(加载失败)]")
+	}
+	if len(images) != 0 {
+		t.Errorf("got %d images, want 0", len(images))
+	}
+}
+
+func TestChatKind(t *testing.T) {
+	if got := chatKind(map[string]any{"message_type": "group"}); got != "group" {
+		t.Errorf("chatKind = %q, want group", got)
+	}
+	if got := chatKind(map[string]any{"message_type": "private"}); got != "private" {
+		t.Errorf("chatKind = %q, want private", got)
+	}
+	if got := chatKind(map[string]any{}); got != "private" {
+		t.Errorf("chatKind = %q, want private (default)", got)
+	}
+}
+
+// TestWithFreshRKeyRebuildsURL pins the fix for images arriving as
+// {"retcode":-5503007,"retmsg":"download url has expired"}: the event url keeps
+// its appid/fileid but the stale rkey is replaced with a current one.
+func TestWithFreshRKeyRebuildsURL(t *testing.T) {
+	p := &Platform{
+		rkeyMap: map[string]rkeyEntry{
+			"group": {value: "FRESHGROUPKEY", fetchedAt: time.Now()},
+		},
+	}
+	stale := "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=ABC123&rkey=STALEKEY"
+
+	got := p.withFreshRKey(stale, "group")
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("rebuilt url does not parse: %v", err)
+	}
+	q := u.Query()
+	if q.Get("rkey") != "FRESHGROUPKEY" {
+		t.Errorf("rkey = %q, want the fresh one", q.Get("rkey"))
+	}
+	if q.Get("fileid") != "ABC123" || q.Get("appid") != "1407" {
+		t.Errorf("appid/fileid were lost: %v", u.RawQuery)
+	}
+	if u.Host != "multimedia.nt.qq.com.cn" {
+		t.Errorf("host = %q", u.Host)
+	}
+}
+
+func TestWithFreshRKeySkipsNonCDNURL(t *testing.T) {
+	p := &Platform{rkeyMap: map[string]rkeyEntry{"group": {value: "K", fetchedAt: time.Now()}}}
+	for _, in := range []string{"", "not a url", "http://example.com/plain.jpg", "https://x.com/d?appid=1"} {
+		if got := p.withFreshRKey(in, "group"); got != "" {
+			t.Errorf("withFreshRKey(%q) = %q, want empty", in, got)
+		}
+	}
+}
+
+func TestCronJobs_AcceptLiteralMessages(t *testing.T) {
+	p, err := New(map[string]any{
+		"cron_jobs": []any{
+			map[string]any{"cron": "0 9 * * *", "message": "/签到", "at": int64(3889045760), "group_id": int64(341353242)},
+			map[string]any{"cron": "0 10 * * *", "prompt": "说点什么", "group_id": int64(341353242)},
+			map[string]any{"cron": "0 11 * * *", "group_id": int64(341353242)}, // neither → ignored
+			map[string]any{"cron": "0 12 * * *", "message": "/x"},              // no group → ignored
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	jobs := p.(*Platform).cronJobs
+	if len(jobs) != 2 {
+		t.Fatalf("got %d jobs, want 2 (only entries with a prompt or message)", len(jobs))
+	}
+	if jobs[0].Message != "/签到" || jobs[0].At != 3889045760 {
+		t.Errorf("literal job parsed wrong: %+v", jobs[0])
+	}
+	if jobs[1].Prompt != "说点什么" {
+		t.Errorf("prompt job parsed wrong: %+v", jobs[1])
+	}
+}
+
+// TestExecuteCronMessageSendsMentionAndText covers the shape another bot has to
+// receive: a real at-segment followed by the command, sent verbatim, without the
+// agent being consulted.
+func TestExecuteCronMessageSendsMentionAndText(t *testing.T) {
+	handled := make(chan *core.Message, 4)
+	plat, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+	}, func(_ core.Platform, m *core.Message) { handled <- m })
+
+	plat.executeCronMessage(cronJobConfig{
+		Cron: "0 9 * * *", Message: "/签到", At: 3889045760, GroupID: 341353242,
+	})
+
+	params := f.sentParams()
+	if len(params) != 1 {
+		t.Fatalf("got %d outgoing messages, want 1", len(params))
+	}
+	if got := params[0]["group_id"]; got != int64(341353242) && got != float64(341353242) {
+		t.Errorf("group_id = %v", got)
+	}
+	segs, ok := params[0]["message"].([]any)
+	if !ok {
+		t.Fatalf("message = %T, want a segment array: %v", params[0]["message"], params[0]["message"])
+	}
+	if len(segs) != 2 {
+		t.Fatalf("got %d segments, want at + text: %v", len(segs), segs)
+	}
+	first := segs[0].(map[string]any)
+	if first["type"] != "at" || first["data"].(map[string]any)["qq"] != "3889045760" {
+		t.Errorf("first segment should be the mention: %v", first)
+	}
+	second := segs[1].(map[string]any)
+	if second["type"] != "text" || second["data"].(map[string]any)["text"] != "/签到" {
+		t.Errorf("second segment should be the command: %v", second)
+	}
+
+	select {
+	case m := <-handled:
+		t.Errorf("a literal cron message must not reach the agent, got %q", m.Content)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestExecuteCronMessageRespectsScope(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{"chat_scope": "private"}, func(core.Platform, *core.Message) {})
+	plat.executeCronMessage(cronJobConfig{Message: "/签到", GroupID: 341353242})
+	if n := len(f.sentParams()); n != 0 {
+		t.Errorf("groups are out of scope but %d message(s) went out", n)
 	}
 }
