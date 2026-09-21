@@ -1509,3 +1509,44 @@ func TestExecuteCronMessageRespectsScope(t *testing.T) {
 		t.Errorf("groups are out of scope but %d message(s) went out", n)
 	}
 }
+
+// TestToolNonAdminMode covers the knob that decides what non-admin group members
+// may reach: "plan" keeps them read-only, while a mode like "dontAsk" lets the
+// agent's allowed_tools (a web search, the send command) run and denies the rest.
+func TestToolNonAdminMode(t *testing.T) {
+	cases := []struct {
+		name string
+		opts map[string]any
+		want string
+	}{
+		{"defaults to plan", map[string]any{}, "plan"},
+		{"blank falls back to plan", map[string]any{"tool_non_admin_mode": "  "}, "plan"},
+		{"explicit mode is used", map[string]any{"tool_non_admin_mode": "dontAsk"}, "dontAsk"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make(chan *core.Message, 4)
+			opts := map[string]any{
+				"share_session_in_channel": true,
+				"tool_admin_only":          true,
+				"admin_ids":                "999",
+				"reply_probability":        0,
+			}
+			for k, v := range tc.opts {
+				opts[k] = v
+			}
+			_, f := startQQ(t, opts, func(_ core.Platform, m *core.Message) { got <- m })
+
+			f.sendEvent(t, textEvent("group", 200, "你好")) // non-admin
+
+			select {
+			case m := <-got:
+				if m.ModeOverride != tc.want {
+					t.Errorf("ModeOverride = %q, want %q", m.ModeOverride, tc.want)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("message never reached the handler")
+			}
+		})
+	}
+}

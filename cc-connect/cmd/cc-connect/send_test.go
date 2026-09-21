@@ -1,8 +1,11 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -163,5 +166,68 @@ func TestBuildSendPayload_JSONRoundTrip(t *testing.T) {
 	}
 	if len(decoded.Files) != 1 || string(decoded.Files[0].Data) != "doc" {
 		t.Fatalf("decoded files = %#v", decoded.Files)
+	}
+}
+
+// TestReadAttachmentFromURL covers handing the send command an http(s) link, so an
+// agent can deliver a file it found online without shelling out to curl.
+func TestReadAttachmentFromURL(t *testing.T) {
+	png := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 128)...)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/teapot" {
+			w.WriteHeader(http.StatusTeapot)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(png)
+	}))
+	defer ts.Close()
+
+	data, name, mime, err := readAttachment(ts.URL + "/photo.png")
+	if err != nil {
+		t.Fatalf("readAttachment(url): %v", err)
+	}
+	if len(data) != len(png) {
+		t.Errorf("got %d bytes, want %d", len(data), len(png))
+	}
+	if name != "photo.png" {
+		t.Errorf("fileName = %q, want photo.png", name)
+	}
+	if !strings.HasPrefix(mime, "image/") {
+		t.Errorf("mime = %q, want an image type", mime)
+	}
+
+	// A CDN-style link with no useful extension still works: the type is sniffed.
+	if _, name, mime, err := readAttachment(ts.URL + "/download?fileid=abc&rkey=x"); err != nil {
+		t.Errorf("readAttachment(extension-less url): %v", err)
+	} else if !strings.HasPrefix(mime, "image/") {
+		t.Errorf("mime = %q, want an image type sniffed from the bytes", mime)
+	} else if name == "" {
+		t.Error("fileName should fall back to something usable")
+	}
+
+	// A non-200 must fail rather than hand back an error page as an attachment.
+	if _, _, _, err := readAttachment(ts.URL + "/teapot"); err == nil {
+		t.Error("expected an error for HTTP 418")
+	}
+}
+
+func TestHttpAttachmentURL(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"https://example.com/a.png", true},
+		{"http://example.com/a.png", true},
+		{"  https://example.com/a.png  ", true},
+		{"/tmp/a.png", false},
+		{"a.png", false},
+		{"file:///tmp/a.png", false},
+		{"ftp://example.com/a.png", false},
+		{"", false},
+	} {
+		if _, got := httpAttachmentURL(tc.in); got != tc.want {
+			t.Errorf("httpAttachmentURL(%q) = %v, want %v", tc.in, got, tc.want)
+		}
 	}
 }

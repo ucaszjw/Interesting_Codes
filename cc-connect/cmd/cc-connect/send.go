@@ -10,9 +10,11 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -187,6 +189,12 @@ func loadFileAttachments(paths []string) ([]core.FileAttachment, error) {
 const maxAttachmentSize = 50 << 20 // 50 MB
 
 func readAttachment(path string) ([]byte, string, string, error) {
+	// An http(s) argument is fetched rather than read from disk, so an agent can
+	// hand over a file it found online without shelling out to curl first.
+	if u, ok := httpAttachmentURL(path); ok {
+		return downloadAttachment(u)
+	}
+
 	cleaned := filepath.Clean(path)
 
 	info, err := os.Stat(cleaned)
@@ -222,6 +230,50 @@ func detectAttachmentMimeType(fileName string, data []byte) string {
 		sniff = sniff[:512]
 	}
 	return http.DetectContentType(sniff)
+}
+
+// attachmentDownloadTimeout bounds a remote attachment fetch.
+const attachmentDownloadTimeout = 30 * time.Second
+
+// httpAttachmentURL reports whether the argument is an http(s) URL to fetch
+// instead of a local path.
+func httpAttachmentURL(raw string) (*url.URL, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return nil, false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, false
+	}
+	return u, true
+}
+
+func downloadAttachment(u *url.URL) ([]byte, string, string, error) {
+	client := &http.Client{Timeout: attachmentDownloadTimeout}
+	resp, err := client.Get(u.String())
+	if err != nil {
+		return nil, "", "", fmt.Errorf("download %s: %w", u, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", "", fmt.Errorf("download %s: HTTP %d", u, resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAttachmentSize+1))
+	if err != nil {
+		return nil, "", "", fmt.Errorf("download %s: %w", u, err)
+	}
+	if int64(len(data)) > maxAttachmentSize {
+		return nil, "", "", fmt.Errorf("attachment %s exceeds size limit (%d MB)", u, maxAttachmentSize>>20)
+	}
+
+	// CDN links often carry no useful extension, so the name is best-effort and
+	// the mime type is sniffed from the bytes when the extension says nothing.
+	fileName := filepath.Base(u.Path)
+	if fileName == "." || fileName == "/" || fileName == "" {
+		fileName = "attachment"
+	}
+	return data, fileName, detectAttachmentMimeType(fileName, data), nil
 }
 
 func buildSendPayload(req core.SendRequest) ([]byte, error) {

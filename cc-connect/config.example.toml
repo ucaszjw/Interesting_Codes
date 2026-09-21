@@ -557,6 +557,13 @@ level = "info" # debug, info, warn, error
 # name = "build"
 # description = "Build the project / 构建项目"
 # exec = "npm run build"
+# allowed_tools / disallowed_tools: tool names to pre-approve or ban for the agent
+# (passed to the CLI as --allowedTools / --disallowedTools). Use with a read-only
+# permission mode to let group chats do research without granting edits or shell.
+# allowed_tools / disallowed_tools：预授权或禁用的工具名，会传给 CLI 的
+# --allowedTools / --disallowedTools。配合只读权限模式，可以让群聊里查资料
+# 而不放开改文件、跑命令的权限。
+# allowed_tools = ["WebSearch", "WebFetch"]
 # work_dir = "/path/to/project"  # Optional: override working directory / 可选：指定工作目录
 
 #
@@ -1457,6 +1464,18 @@ app_secret = "your-feishu-app-secret"
 #             在线切换会存到数据目录，重启后优先于这里的配置值。
 #             Private chats never get voice replies (text only).
 #             私聊永远只发文字，不发语音。
+# tool_admin_only / tool_non_admin_mode: what non-admin group members may reach.
+# tool_admin_only = true puts them in tool_non_admin_mode, "plan" by default (read
+# only, no tools at all). Use "dontAsk" to instead run only the agent's
+# allowed_tools — e.g. a web search or `cc-connect send` — and silently deny the
+# rest. Whatever you whitelist there, everyone in the group can trigger it.
+# tool_admin_only / tool_non_admin_mode：非管理员群成员能碰到什么。
+# tool_admin_only = true 会让非管理员进入 tool_non_admin_mode（默认 "plan"，只读、
+# 完全不能用工具）。改成 "dontAsk" 则只跑 agent 的 allowed_tools（比如联网搜索、
+# cc-connect send），其余静默拒绝。注意白名单里的能力是群里所有人共用的。
+# tool_admin_only = false
+# tool_non_admin_mode = "plan"     # "plan" | "dontAsk" | "default" | "acceptEdits"
+#
 # chat_scope = "all"
 #
 # How chatty the bot is in groups / 群聊里的说话频率

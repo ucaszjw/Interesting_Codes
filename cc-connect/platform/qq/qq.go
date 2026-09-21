@@ -38,7 +38,8 @@ type Platform struct {
 	allowFrom             string // comma-separated user IDs or "*"
 	shareSessionInChannel bool
 	requireAt             bool   // only respond to group messages that @ the bot
-	toolAdminOnly         bool   // non-admin users get plan mode (chat only, no tools)
+	toolAdminOnly         bool   // restrict non-admin users to toolNonAdminMode
+	toolNonAdminMode      string // permission mode for non-admins (default "plan")
 	adminIDs              string // comma-separated admin user IDs
 	groupAllow            string // comma-separated group IDs or "*"
 	handler               core.MessageHandler
@@ -235,6 +236,15 @@ func New(opts map[string]any) (core.Platform, error) {
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	requireAt, _ := opts["require_at"].(bool)
 	toolAdminOnly, _ := opts["tool_admin_only"].(bool)
+	toolNonAdminMode, _ := opts["tool_non_admin_mode"].(string)
+	toolNonAdminMode = strings.TrimSpace(toolNonAdminMode)
+	if toolNonAdminMode == "" {
+		// Plan mode keeps non-admins read-only; the agent's allowed_tools decide
+		// whether anything at all is reachable. "dontAsk" runs only pre-approved
+		// tools (e.g. a web search or the send command) and silently denies the
+		// rest, which is what you want when the bot replies to strangers.
+		toolNonAdminMode = "plan"
+	}
 	adminIDs, _ := opts["admin_ids"].(string)
 	groupAllow, _ := opts["group_allow"].(string)
 
@@ -309,6 +319,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		shareSessionInChannel: shareSessionInChannel,
 		requireAt:             requireAt,
 		toolAdminOnly:         toolAdminOnly,
+		toolNonAdminMode:      toolNonAdminMode,
 		adminIDs:              adminIDs,
 		groupAllow:            groupAllow,
 		replyWithQuote:        replyWithQuote,
@@ -604,7 +615,7 @@ func (p *Platform) handleMessage(payload map[string]any) {
 	// If tool_admin_only is set, non-admin users get plan mode (chat only, no tools)
 	var modeOverride string
 	if p.toolAdminOnly && !p.isAdmin(userID) {
-		modeOverride = "plan"
+		modeOverride = p.toolNonAdminMode
 	}
 
 	// Permission replies are the engine's call: only it knows whether a request is
@@ -788,7 +799,7 @@ func (p *Platform) handlePoke(payload map[string]any) {
 
 	var modeOverride string
 	if p.toolAdminOnly && !p.isAdmin(userID) {
-		modeOverride = "plan"
+		modeOverride = p.toolNonAdminMode
 	}
 
 	msg := &core.Message{
