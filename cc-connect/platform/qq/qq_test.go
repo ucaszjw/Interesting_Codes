@@ -1550,3 +1550,95 @@ func TestToolNonAdminMode(t *testing.T) {
 		})
 	}
 }
+
+// TestThrottledImageIsDeferredNotDropped is the regression test for a group member
+// asking "这图是啥" and being told "我这边只收到一行「[图片]」，没图可看": an image that
+// lost the cooldown used to be discarded, leaving only its text marker in the
+// backlog. It must instead ride along with the next reply that gets through.
+func TestThrottledImageIsDeferredNotDropped(t *testing.T) {
+	got := make(chan *core.Message, 4)
+	plat, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+		"reply_probability":        100,
+		"reply_cooldown":           3600, // everything ambient is suppressed
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+
+	// The bot just spoke, so the cooldown is in force.
+	plat.replyStateMap.Store("qq:g:100", &replyState{lastReplyTime: time.Now()})
+
+	// An image arrives and loses the cooldown...
+	sendTestImage(t, f, 100, 200)
+	select {
+	case m := <-got:
+		t.Fatalf("image delivered despite the cooldown: %+v", m)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// ...but an @-mention still gets through, and it must carry that picture.
+	f.sendEvent(t, map[string]any{
+		"post_type":    "message",
+		"message_type": "group",
+		"group_id":     int64(100),
+		"user_id":      int64(201),
+		"message_id":   int64(99),
+		"message": []any{
+			map[string]any{"type": "at", "data": map[string]any{"qq": strconv.Itoa(fakeBotUserID)}},
+			map[string]any{"type": "text", "data": map[string]any{"text": " 这图是啥"}},
+		},
+	})
+
+	select {
+	case m := <-got:
+		if len(m.Images) != 1 {
+			t.Fatalf("the deferred image did not ride along: got %d images (content=%q)", len(m.Images), m.Content)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the @-mention never reached the handler")
+	}
+}
+
+// TestDeferredImagesAreCappedAndExpire keeps the deferral bounded.
+func TestDeferredImagesAreCappedAndExpire(t *testing.T) {
+	p := &Platform{}
+	img := core.ImageAttachment{MimeType: "image/png", Data: []byte("x")}
+
+	for i := 0; i < maxPendingImages+3; i++ {
+		p.stashImages("s", []core.ImageAttachment{img})
+	}
+	if got := len(p.takeImages("s")); got != maxPendingImages {
+		t.Errorf("kept %d deferred images, want the cap %d", got, maxPendingImages)
+	}
+	// takeImages clears, so a second call has nothing.
+	if got := p.takeImages("s"); got != nil {
+		t.Errorf("expected the stash to be cleared, got %d images", len(got))
+	}
+
+	// Anything older than the TTL is dropped instead of attached to a later reply.
+	p.pendingImages = map[string]*pendingAttachments{
+		"s": {images: []core.ImageAttachment{img}, firstSeen: time.Now().Add(-pendingAttachmentTTL - time.Minute)},
+	}
+	if got := p.takeImages("s"); got != nil {
+		t.Errorf("an expired stash should be dropped, got %d images", len(got))
+	}
+}
+
+// TestDefaultPersonaIsSelectable guards the one invariant that matters for the
+// fallback persona: its name has to be one /persona can select and the prompt
+// describes, otherwise a session without an override gets a tag nobody can play.
+func TestDefaultPersonaIsSelectable(t *testing.T) {
+	if got := validPersonas[defaultPersona]; got != defaultPersona {
+		t.Errorf("defaultPersona %q resolves to %q; it must be a known persona", defaultPersona, got)
+	}
+	if !strings.Contains(personaListText(), defaultPersona) {
+		t.Errorf("defaultPersona %q is missing from the /persona listing", defaultPersona)
+	}
+}
+
+// TestDefaultPersonaDrivesGroupContext pins that an untouched group session is
+// tagged with the default persona.
+func TestDefaultPersonaDrivesGroupContext(t *testing.T) {
+	p := &Platform{}
+	if got := p.makeGroupExtraContent("qq:g:1"); got != "[群聊消息]["+defaultPersona+"]" {
+		t.Errorf("makeGroupExtraContent = %q, want the default persona %q", got, defaultPersona)
+	}
+}

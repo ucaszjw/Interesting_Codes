@@ -116,7 +116,25 @@ type Platform struct {
 	// with a fresh one from get_rkey.
 	rkeyMu  sync.Mutex
 	rkeyMap map[string]rkeyEntry
+
+	// Images that arrived while the session was throttled, kept until the next
+	// message that actually gets answered.
+	pendingMu     sync.Mutex
+	pendingImages map[string]*pendingAttachments
 }
+
+// pendingAttachments holds images deferred by the throttle for one session.
+type pendingAttachments struct {
+	images    []core.ImageAttachment
+	firstSeen time.Time
+}
+
+const (
+	// maxPendingImages caps how many deferred pictures are carried over, newest wins.
+	maxPendingImages = 4
+	// pendingAttachmentTTL drops a deferred picture that waited too long to be useful.
+	pendingAttachmentTTL = 10 * time.Minute
+)
 
 // rkeyEntry is a cached CDN rkey with the time it was fetched.
 type rkeyEntry struct {
@@ -660,7 +678,11 @@ func (p *Platform) handleMessage(payload map[string]any) {
 			now := time.Now()
 			if p.inCooldown(rs, now) {
 				rs.skipCount++
-				slog.Info("qq: skip, cooldown", "session", sessionKey, "kind", "attachment")
+				// Defer rather than drop: the backlog can only carry the "[图片]"
+				// marker, so discarding the bytes would leave the agent reading about
+				// a picture it cannot see.
+				p.stashImages(sessionKey, images)
+				slog.Info("qq: skip, cooldown", "session", sessionKey, "kind", "attachment", "deferred", len(images))
 				return
 			}
 			rs.lastReplyTime = now
@@ -686,6 +708,12 @@ func (p *Platform) handleMessage(payload map[string]any) {
 	if shortReply {
 		extraContent += " 简短回复，像日常聊天一样说一两句即可，不要长篇大论"
 	}
+	// Any picture the throttle held back rides along with this reply, so the
+	// "[图片]" line in the backlog finally has its attachment.
+	if deferred := p.takeImages(sessionKey); len(deferred) > 0 {
+		images = append(deferred, images...)
+	}
+
 	msg := &core.Message{
 		SessionKey:   sessionKey,
 		Platform:     "qq",
@@ -1392,8 +1420,10 @@ func (p *Platform) executeCronJob(groupID int64, prompt string, _ int) {
 	p.handler(p, msg)
 }
 
-// defaultPersona is used when a group session has no /persona override.
-const defaultPersona = "贴吧老哥"
+// defaultPersona is used when a group session has no /persona override. It has to
+// name a persona the prompt actually describes — TestDefaultPersonaIsSelectable
+// guards that.
+const defaultPersona = "群友"
 
 // personaFor returns the persona tag for a session, falling back to the default.
 func (p *Platform) personaFor(sessionKey string) string {
@@ -1449,6 +1479,45 @@ func (p *Platform) flushBuffer(sessionKey string) string {
 	}
 	p.msgBufferMap.Delete(sessionKey)
 	return result
+}
+
+// ── Deferred attachments ────────────────────────
+
+// stashImages remembers pictures that arrived while the session was throttled.
+func (p *Platform) stashImages(sessionKey string, images []core.ImageAttachment) {
+	if len(images) == 0 {
+		return
+	}
+	p.pendingMu.Lock()
+	defer p.pendingMu.Unlock()
+	if p.pendingImages == nil {
+		p.pendingImages = map[string]*pendingAttachments{}
+	}
+	entry, ok := p.pendingImages[sessionKey]
+	if !ok || time.Since(entry.firstSeen) > pendingAttachmentTTL {
+		entry = &pendingAttachments{firstSeen: time.Now()}
+		p.pendingImages[sessionKey] = entry
+	}
+	entry.images = append(entry.images, images...)
+	if len(entry.images) > maxPendingImages {
+		entry.images = entry.images[len(entry.images)-maxPendingImages:]
+	}
+}
+
+// takeImages returns and clears the pictures deferred for this session. Pictures
+// that waited past the TTL are dropped rather than attached to an unrelated reply.
+func (p *Platform) takeImages(sessionKey string) []core.ImageAttachment {
+	p.pendingMu.Lock()
+	defer p.pendingMu.Unlock()
+	entry, ok := p.pendingImages[sessionKey]
+	if !ok {
+		return nil
+	}
+	delete(p.pendingImages, sessionKey)
+	if time.Since(entry.firstSeen) > pendingAttachmentTTL {
+		return nil
+	}
+	return entry.images
 }
 
 // ── Reply probability ───────────────────────────
