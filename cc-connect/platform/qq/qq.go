@@ -185,6 +185,7 @@ var personaCommands = []struct {
 	{"男朋友", []string{"bf", "boyfriend"}},
 	{"女朋友", []string{"gf", "girlfriend"}},
 	{"群友", []string{"qunyou", "群u"}},
+	{"大肥鱼", []string{"feiyu", "肥鱼"}},
 }
 
 // validPersonas resolves a /persona argument (or a persona tag itself) to its tag.
@@ -1423,7 +1424,7 @@ func (p *Platform) executeCronJob(groupID int64, prompt string, _ int) {
 // defaultPersona is used when a group session has no /persona override. It has to
 // name a persona the prompt actually describes — TestDefaultPersonaIsSelectable
 // guards that.
-const defaultPersona = "群友"
+const defaultPersona = "大肥鱼"
 
 // personaFor returns the persona tag for a session, falling back to the default.
 func (p *Platform) personaFor(sessionKey string) string {
