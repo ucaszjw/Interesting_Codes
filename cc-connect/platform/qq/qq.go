@@ -822,7 +822,9 @@ func (p *Platform) handlePoke(payload map[string]any) {
 	}
 
 	var extraContent string
-	if msgType == "group" || (p.toolAdminOnly && !p.isAdmin(userID)) {
+	if msgType == "group" {
+		extraContent = fmt.Sprintf("%s (%d):", p.makeGroupExtraContent(sessionKey), userID)
+	} else if p.toolAdminOnly && !p.isAdmin(userID) {
 		extraContent = "[群聊消息]"
 	}
 
@@ -1437,7 +1439,16 @@ func (p *Platform) personaFor(sessionKey string) string {
 }
 
 func (p *Platform) makeGroupExtraContent(sessionKey string) string {
-	return "[群聊消息][" + p.personaFor(sessionKey) + "]"
+	return "[群聊消息][" + p.personaFor(sessionKey) + "][" + timeContext() + "]"
+}
+
+// timeContext renders the current local time so the agent has a clock. Without it
+// the model can only guess "now" from its training data, which makes it useless
+// for anything hour-dependent ("都这个点了还不睡?" / "现在几点").
+func timeContext() string {
+	weekdays := [...]string{"周日", "周一", "周二", "周三", "周四", "周五", "周六"}
+	now := time.Now()
+	return now.Format("2006-01-02 15:04") + " " + weekdays[now.Weekday()]
 }
 
 // ── Message buffer ──────────────────────────────

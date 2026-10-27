@@ -1638,7 +1638,52 @@ func TestDefaultPersonaIsSelectable(t *testing.T) {
 // tagged with the default persona.
 func TestDefaultPersonaDrivesGroupContext(t *testing.T) {
 	p := &Platform{}
-	if got := p.makeGroupExtraContent("qq:g:1"); got != "[群聊消息]["+defaultPersona+"]" {
-		t.Errorf("makeGroupExtraContent = %q, want the default persona %q", got, defaultPersona)
+	got := p.makeGroupExtraContent("qq:g:1")
+	wantPrefix := "[群聊消息][" + defaultPersona + "]["
+	if !strings.HasPrefix(got, wantPrefix) {
+		t.Errorf("makeGroupExtraContent = %q, want prefix %q", got, wantPrefix)
+	}
+}
+
+// TestTimeContext pins that group context carries a clock: without it the model
+// can only guess "now" from its training data, so questions like "现在几点" or
+// "都这么晚了还不睡" come out wrong.
+func TestTimeContext(t *testing.T) {
+	got := timeContext()
+	if !regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2} 周[日一二三四五六]$`).MatchString(got) {
+		t.Errorf("timeContext = %q, want e.g. 2026-10-27 23:12 周二", got)
+	}
+
+	extra := (&Platform{}).makeGroupExtraContent("qq:g:1")
+	if !strings.Contains(extra, "][") || !strings.Contains(extra, timeContext()[:10]) {
+		t.Errorf("makeGroupExtraContent = %q, want it to embed today's date", extra)
+	}
+}
+
+// TestPokeCarriesPersonaAndTime: a group poke used to say only "[群聊消息]", so the
+// agent had neither the persona tag nor the time for that turn.
+func TestPokeCarriesPersonaAndTime(t *testing.T) {
+	got := make(chan *core.Message, 4)
+	plat, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+	plat.personaMap.Store("qq:g:100", "大肥鱼")
+
+	f.sendEvent(t, map[string]any{
+		"post_type":   "notice",
+		"notice_type": "notify",
+		"sub_type":    "poke",
+		"group_id":    int64(100),
+		"user_id":     int64(200),
+		"target_id":   int64(fakeBotUserID),
+	})
+
+	select {
+	case m := <-got:
+		if !strings.Contains(m.ExtraContent, "[群聊消息][大肥鱼][") {
+			t.Errorf("poke ExtraContent = %q, want persona + time", m.ExtraContent)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("poke never reached the handler")
 	}
 }
