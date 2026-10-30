@@ -1163,6 +1163,151 @@ func TestParseMessage_MarksImages(t *testing.T) {
 	}
 }
 
+func TestMarkdownParts(t *testing.T) {
+	// Shaped like a real QQ bot reply: a JSON protocol header in an empty link,
+	// percent-encoded throughout, with a mention whose target is an mqqapi URL.
+	raw := "[](%7B%22version%22%3A2%7D)\n[@蓝色大肥鱼](mqqapi://markdown/mention?uid=0)  **继续加油~目前已猜 4 次，还剩 6 次机会**"
+
+	text, images := markdownParts(raw)
+	want := "@蓝色大肥鱼  继续加油~目前已猜 4 次，还剩 6 次机会"
+	if text != want {
+		t.Errorf("markdownParts() text = %q, want %q", text, want)
+	}
+	if len(images) != 0 {
+		t.Errorf("markdownParts() images = %v, want none", images)
+	}
+}
+
+func TestMarkdownParts_ExtractsInlineImages(t *testing.T) {
+	// The game replies carry a board screenshot inline: ![图片 #954px #208px](url).
+	raw := "[](%7B%22version%22%3A2%7D)\n[@蓝色大肥鱼](mqqapi://markdown/mention?uid=0)( •̀ ω •́ )✧ 继续加油~目前已猜 2 次，还剩 8 次机会![图片 #964px #208px](https://qqbot.ugcimg.cn/102076836/abc%2Fdef)"
+
+	text, images := markdownParts(raw)
+	if want := "@蓝色大肥鱼( •̀ ω •́ )✧ 继续加油~目前已猜 2 次，还剩 8 次机会"; text != want {
+		t.Errorf("markdownParts() text = %q, want %q", text, want)
+	}
+	// The whole payload is percent-decoded first, so escaped path separators
+	// come back as plain characters.
+	if len(images) != 1 || images[0] != "https://qqbot.ugcimg.cn/102076836/abc/def" {
+		t.Errorf("markdownParts() images = %v, want the inline image URL", images)
+	}
+}
+
+func TestMarkdownParts_PlainTextUnchanged(t *testing.T) {
+	if text, images := markdownParts("  你好  "); text != "你好" || len(images) != 0 {
+		t.Errorf("markdownParts() = %q, %v; want 你好, none", text, images)
+	}
+}
+
+func TestParseMessage_ReadsMarkdownSegment(t *testing.T) {
+	p := &Platform{}
+	payload := map[string]any{
+		"message": []any{
+			map[string]any{
+				"type": "markdown",
+				"data": map[string]any{
+					"content": "[](%7B%22version%22%3A2%7D)\n[继续](mqqapi://x) 猜了 3 次",
+				},
+			},
+		},
+	}
+
+	text, images, _, fromVoice := p.parseMessage(payload)
+
+	if !strings.Contains(text, "猜了 3 次") {
+		t.Errorf("text = %q, want it to contain the markdown body", text)
+	}
+	if strings.Contains(text, "%22") || strings.Contains(text, "mqqapi://") {
+		t.Errorf("text = %q, markdown protocol noise was not stripped", text)
+	}
+	if strings.Contains(text, "[继续]") {
+		t.Errorf("text = %q, link syntax should be flattened to its label", text)
+	}
+	if len(images) != 0 || fromVoice {
+		t.Errorf("markdown carries no attachment: images=%d voice=%v", len(images), fromVoice)
+	}
+}
+
+func TestParseMessage_DedupesMarkdownEcho(t *testing.T) {
+	// Real QQ bot replies send the body twice: once inside the markdown element
+	// and once as a plain text segment (after the mention).
+	p := &Platform{}
+	payload := map[string]any{
+		"message": []any{
+			map[string]any{
+				"type": "markdown",
+				"data": map[string]any{
+					"content": "[](%7B%22version%22%3A2%7D)\n[@蓝色大肥鱼](mqqapi://markdown/mention?uid=0)继续加油~目前已猜 2 次",
+				},
+			},
+			map[string]any{"type": "at", "data": map[string]any{"qq": "1105314101"}},
+			map[string]any{"type": "text", "data": map[string]any{"text": " "}},
+			map[string]any{"type": "text", "data": map[string]any{"text": "继续加油~目前已猜 2 次"}},
+		},
+	}
+
+	text, _, _, _ := p.parseMessage(payload)
+
+	if n := strings.Count(text, "继续加油"); n != 1 {
+		t.Errorf("text = %q, body appears %d times, want 1", text, n)
+	}
+}
+
+func TestParseMessage_KeepsNonEchoTextAfterMarkdown(t *testing.T) {
+	p := &Platform{}
+	payload := map[string]any{
+		"message": []any{
+			map[string]any{
+				"type": "markdown",
+				"data": map[string]any{"content": "[](%7B%22version%22%3A2%7D)\n第一段"},
+			},
+			map[string]any{"type": "text", "data": map[string]any{"text": "第二段"}},
+		},
+	}
+
+	text, _, _, _ := p.parseMessage(payload)
+
+	if !strings.Contains(text, "第一段") || !strings.Contains(text, "第二段") {
+		t.Errorf("text = %q, want both parts", text)
+	}
+}
+
+func TestParseMessage_DownloadsInlineMarkdownImage(t *testing.T) {
+	png := []byte("\x89PNG\r\n\x1a\n" + "fake")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(png)
+	}))
+	defer ts.Close()
+
+	p := &Platform{}
+	payload := map[string]any{
+		"message": []any{
+			map[string]any{
+				"type": "markdown",
+				"data": map[string]any{
+					"content": "[](%7B%22version%22%3A2%7D)\n继续加油![图片](" + ts.URL + ")",
+				},
+			},
+		},
+	}
+
+	text, images, _, fromVoice := p.parseMessage(payload)
+
+	if text != "继续加油[图片]" {
+		t.Errorf("text = %q, want %q", text, "继续加油[图片]")
+	}
+	if len(images) != 1 {
+		t.Fatalf("got %d images, want 1", len(images))
+	}
+	if images[0].MimeType != "image/png" || len(images[0].Data) == 0 {
+		t.Errorf("bad attachment: mime=%q len=%d", images[0].MimeType, len(images[0].Data))
+	}
+	if fromVoice {
+		t.Error("a markdown image is not a voice message")
+	}
+}
+
 // TestImageSkipsDice checks that an image does not need to win the reply dice:
 // a dropped attachment cannot be recovered, because the backlog keeps text only.
 // The dice are pinned to 1% here to make that unambiguous.
@@ -1685,5 +1830,321 @@ func TestPokeCarriesPersonaAndTime(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("poke never reached the handler")
+	}
+}
+
+func TestAtSegments(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		want []string // "text:..." or "at:..."
+	}{
+		{"no marker", "你好啊", nil},
+		{"leading", "[at:123] 起床了", []string{"at:123", "text: 起床了"}},
+		{"middle", "叫 [at:123] 起床", []string{"text:叫 ", "at:123", "text: 起床"}},
+		{"trailing", "看这个 [at:123]", []string{"text:看这个 ", "at:123"}},
+		{"multiple", "[at:1][at:2] 来", []string{"at:1", "at:2", "text: 来"}},
+		{"malformed left alone", "[at:abc] 你好", nil},
+		{"empty qq left alone", "[at:] 你好", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			segs, ok := atSegments(tc.in)
+			if tc.want == nil {
+				if ok {
+					t.Fatalf("expected no marker, got %v", segs)
+				}
+				return
+			}
+			if !ok {
+				t.Fatalf("expected a marker in %q", tc.in)
+			}
+			var got []string
+			for _, s := range segs {
+				switch s["type"] {
+				case "at":
+					got = append(got, "at:"+s["data"].(map[string]any)["qq"].(string))
+				case "text":
+					got = append(got, "text:"+s["data"].(map[string]any)["text"].(string))
+				}
+			}
+			if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+				t.Errorf("atSegments(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSendConvertsAtMarker: only a real at-segment makes QQ show a mention and
+// makes another bot treat it as being addressed.
+func TestSendConvertsAtMarker(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{"reply_with_quote": false}, func(core.Platform, *core.Message) {})
+
+	rctx := &replyContext{messageType: "group", groupID: 341353242}
+	if err := plat.Send(context.Background(), rctx, "[at:3889045760] 签到去"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	params := f.sentParams()
+	if len(params) != 1 {
+		t.Fatalf("got %d messages, want 1", len(params))
+	}
+	segs, ok := params[0]["message"].([]any)
+	if !ok {
+		t.Fatalf("message is %T, want segments: %v", params[0]["message"], params[0]["message"])
+	}
+	if len(segs) != 2 {
+		t.Fatalf("got %d segments, want at + text: %v", len(segs), segs)
+	}
+	first := segs[0].(map[string]any)
+	if first["type"] != "at" || first["data"].(map[string]any)["qq"] != "3889045760" {
+		t.Errorf("first segment should be the mention: %v", first)
+	}
+	if txt := segs[1].(map[string]any)["data"].(map[string]any)["text"]; txt != " 签到去" {
+		t.Errorf("text segment = %q", txt)
+	}
+}
+
+func TestSendKeepsQuoteBeforeMention(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{"reply_with_quote": true}, func(core.Platform, *core.Message) {})
+
+	rctx := &replyContext{messageType: "group", groupID: 341353242, messageID: 42}
+	if err := plat.Send(context.Background(), rctx, "喊一下 [at:123] 过来"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	segs := f.sentParams()[0]["message"].([]any)
+	// reply + "喊一下 " + at + " 过来"
+	if len(segs) != 4 {
+		t.Fatalf("got %d segments, want reply+text+at+text: %v", len(segs), segs)
+	}
+	if kind := segs[0].(map[string]any)["type"]; kind != "reply" {
+		t.Errorf("first segment = %v, want reply (the quote must stay first)", kind)
+	}
+	if kind := segs[2].(map[string]any)["type"]; kind != "at" {
+		t.Errorf("segment 2 = %v, want at", kind)
+	}
+}
+
+// TestSendWithoutMarkerStaysPlainText keeps the wire format of the common case.
+func TestSendWithoutMarkerStaysPlainText(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{}, func(core.Platform, *core.Message) {})
+	rctx := &replyContext{messageType: "group", groupID: 1}
+	if err := plat.Send(context.Background(), rctx, "普通回复"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if _, isString := f.sentParams()[0]["message"].(string); !isString {
+		t.Errorf("message should be a plain string, got %T", f.sentParams()[0]["message"])
+	}
+}
+
+// TestBotPeerAnsweredOnlyDuringGame: bot traffic is ignored entirely unless a game
+// with that peer is running, which is what replaces the old round cap.
+func TestBotPeerAnsweredOnlyDuringGame(t *testing.T) {
+	got := make(chan *core.Message, 8)
+	plat, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+		"allow_from":               "111", // peer is deliberately absent
+		"bot_peers":                "3889001246",
+		"reply_probability":        1,
+		"reply_prob_min":           1,
+		"reply_prob_max":           1,
+		"reply_cooldown":           3600, // and the ambient throttle is shut
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+	plat.replyStateMap.Store("qq:g:100", &replyState{lastReplyTime: time.Now()})
+
+	// No game: nothing happens, even though the peer is admitted by the allowlist.
+	f.sendEvent(t, textEvent("group", 3889001246, "/我猜MC是 猪"))
+	select {
+	case m := <-got:
+		t.Fatalf("peer answered with no game running: %q", m.Content)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	// Game on: answered despite the throttle.
+	plat.setGame(100, 3889001246)
+	f.sendEvent(t, textEvent("group", 3889001246, "/我猜MC是 猪"))
+	select {
+	case <-got:
+	case <-time.After(3 * time.Second):
+		t.Fatal("peer not answered during an active game")
+	}
+}
+
+// TestPeerGameIgnoresOtherBots keeps unrelated bots out while one game runs.
+func TestPeerGameIgnoresOtherBots(t *testing.T) {
+	got := make(chan *core.Message, 8)
+	plat, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+		"bot_peers":                "3889001246,777000",
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+	plat.setGame(100, 3889001246)
+
+	f.sendEvent(t, textEvent("group", 777000, "我也来一句"))
+	select {
+	case m := <-got:
+		t.Fatalf("another bot was answered mid-game: %q", m.Content)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// TestPeerMinGapBlocksTightLoop: a peer replying instantly is not a conversation.
+func TestPeerMinGapBlocksTightLoop(t *testing.T) {
+	got := make(chan *core.Message, 8)
+	plat, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+		"bot_peers":                "3889001246",
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+	plat.setGame(100, 3889001246)
+
+	f.sendEvent(t, textEvent("group", 3889001246, "第一句"))
+	select {
+	case <-got:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first peer message should pass")
+	}
+
+	f.sendEvent(t, textEvent("group", 3889001246, "立刻第二句"))
+	select {
+	case m := <-got:
+		t.Fatalf("a reply within %s should be dropped as a tight loop, got %q", peerMinGap, m.Content)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+func TestGameLifecycle(t *testing.T) {
+	p := &Platform{}
+	if _, ok := p.gamePeer(1); ok {
+		t.Fatal("no game should be active initially")
+	}
+
+	p.setGame(1, 123)
+	if peer, ok := p.gamePeer(1); !ok || peer != 123 {
+		t.Fatalf("gamePeer = %d,%v; want 123,true", peer, ok)
+	}
+
+	// A different group is unaffected.
+	if _, ok := p.gamePeer(2); ok {
+		t.Error("game must be scoped to its group")
+	}
+
+	// Expired games are dropped.
+	p.games.Store(int64(1), &gameState{peer: 123, expiresAt: time.Now().Add(-time.Second)})
+	if _, ok := p.gamePeer(1); ok {
+		t.Error("an expired game must not stay active")
+	}
+
+	// Manual end.
+	p.setGame(1, 123)
+	p.clearGame(1)
+	if _, ok := p.gamePeer(1); ok {
+		t.Error("clearGame must end the game")
+	}
+}
+
+// TestSendParsesGameMarkers: the model toggles the game with markers, which must
+// not leak into the outgoing text.
+func TestSendParsesGameMarkers(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{}, func(core.Platform, *core.Message) {})
+	rctx := &replyContext{messageType: "group", groupID: 100}
+
+	if err := plat.Send(context.Background(), rctx,
+		"[game:start:3889001246] [at:3889001246] /我猜MC是 猪"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if peer, ok := plat.gamePeer(100); !ok || peer != 3889001246 {
+		t.Fatalf("game not started: %d,%v", peer, ok)
+	}
+	params := f.sentParams()[0]
+	segs := params["message"].([]any)
+	for _, seg := range segs {
+		if seg.(map[string]any)["type"] == "text" {
+			txt, _ := seg.(map[string]any)["data"].(map[string]any)["text"].(string)
+			if strings.Contains(txt, "game:") {
+				t.Errorf("game marker leaked into the message: %q", txt)
+			}
+		}
+	}
+
+	if err := plat.Send(context.Background(), rctx, "[game:end] 猜对啦"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if _, ok := plat.gamePeer(100); ok {
+		t.Error("game should be over")
+	}
+}
+
+// TestSendArmsGameByMentioningPeer covers the case where the model forgets the
+// [game:start:<uid>] marker: without arming, the peer's reply is dropped and the
+// game stalls until a human says "继续".
+func TestSendArmsGameByMentioningPeer(t *testing.T) {
+	plat, _ := startQQ(t, map[string]any{"bot_peers": "3889001246"}, func(core.Platform, *core.Message) {})
+	rctx := &replyContext{messageType: "group", groupID: 100}
+
+	if err := plat.Send(context.Background(), rctx, "[at:3889001246] /猜MC生物 困难"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if peer, ok := plat.gamePeer(100); !ok || peer != 3889001246 {
+		t.Fatalf("mentioning a bot peer should arm the game, got %d,%v", peer, ok)
+	}
+}
+
+// TestSendMentioningHumanDoesNotArmGame: regular @mentions must not turn on
+// bot-peer traffic.
+func TestSendMentioningHumanDoesNotArmGame(t *testing.T) {
+	plat, _ := startQQ(t, map[string]any{"bot_peers": "3889001246"}, func(core.Platform, *core.Message) {})
+	rctx := &replyContext{messageType: "group", groupID: 100}
+
+	if err := plat.Send(context.Background(), rctx, "[at:2232095290] 张氏来玩"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if peer, ok := plat.gamePeer(100); ok {
+		t.Fatalf("human mention armed a game with %d", peer)
+	}
+}
+
+// TestObserveLearnsBotCommands: traffic we do not answer teaches us how the other
+// bots in the group are used, and the learned hint reaches the agent context.
+func TestObserveLearnsBotCommands(t *testing.T) {
+	got := make(chan *core.Message, 8)
+	_, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+		"allow_from":               "111,200", // 200 may talk to us
+		"reply_probability":        0,
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+
+	// A stranger invokes a command on another bot: recorded, never answered.
+	f.sendEvent(t, map[string]any{
+		"post_type": "message", "message_type": "group", "group_id": int64(100),
+		"user_id": int64(999), "message_id": int64(1),
+		"message": []any{
+			map[string]any{"type": "at", "data": map[string]any{"qq": "3889001246"}},
+			map[string]any{"type": "text", "data": map[string]any{"text": " /我猜MC是 猪"}},
+		},
+	})
+	select {
+	case m := <-got:
+		t.Fatalf("a stranger must not be answered, got %q", m.Content)
+	case <-time.After(400 * time.Millisecond):
+	}
+
+	// The next real message should carry the learned hint.
+	f.sendEvent(t, textEvent("group", 200, "你好"))
+	select {
+	case m := <-got:
+		if !strings.Contains(m.ExtraContent, "3889001246") || !strings.Contains(m.ExtraContent, "/我猜MC是") {
+			t.Errorf("ExtraContent = %q, want the learned bot hint", m.ExtraContent)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("message never reached the handler")
+	}
+}
+
+func TestIsAllowedIncludesBotPeers(t *testing.T) {
+	p := &Platform{allowFrom: "111", botPeers: map[int64]bool{3889001246: true}}
+	if !p.isAllowed(3889001246) {
+		t.Error("a configured bot peer must be admitted")
+	}
+	if p.isAllowed(222) {
+		t.Error("an unlisted user must not be admitted")
 	}
 }

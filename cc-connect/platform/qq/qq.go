@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -121,7 +123,54 @@ type Platform struct {
 	// message that actually gets answered.
 	pendingMu     sync.Mutex
 	pendingImages map[string]*pendingAttachments
+
+	// Bot peers we may hold a back-and-forth with (e.g. another bot in a guessing
+	// game). They are admitted past the allowlist, but only answered while a game
+	// with them is active — see gameState. That is what bounds bot-to-bot traffic.
+	botPeers   map[int64]bool
+	peerMu     sync.Mutex
+	peerChains sync.Map // groupID -> *peerChain
+
+	// games holds the in-progress bot exchange per group. A model-emitted
+	// [game:start:<uid>] / [game:end] toggles it; it also expires on its own so a
+	// forgotten [game:end] cannot leave the bot permanently mute.
+	gameMu sync.Mutex
+	games  sync.Map // groupID -> *gameState
+
+	// observed records what we passively learn about other bots in the group, so
+	// their usage does not have to be hardcoded in the prompt.
+	observedMu sync.Mutex
+	observed   map[int64]*observedBot
+	seenNames  map[int64]string
 }
+
+// peerChain tracks the pacing of one bot-to-bot conversation.
+type peerChain struct {
+	lastAt time.Time
+}
+
+// gameState marks an active game with one bot in one group.
+type gameState struct {
+	peer      int64
+	expiresAt time.Time
+}
+
+// observedBot is what a group's traffic revealed about another bot.
+type observedBot struct {
+	command  string // e.g. "/我猜MC是"
+	lastSeen time.Time
+}
+
+const (
+	// peerMinGap is the floor between answers to a peer: a faster reply would mean
+	// the two bots are tight-looping rather than conversing.
+	peerMinGap = 3 * time.Second
+	// gameTTL bounds a game. Every exchange extends it, so an active game keeps
+	// going while an abandoned one stops.
+	gameTTL = 10 * time.Minute
+	// maxObservedBots caps the learned table.
+	maxObservedBots = 50
+)
 
 // pendingAttachments holds images deferred by the throttle for one session.
 type pendingAttachments struct {
@@ -281,6 +330,13 @@ func New(opts map[string]any) (core.Platform, error) {
 	replyProbMin := optIntOr(opts, "reply_prob_min", 10)
 	replyProbMax := optIntOr(opts, "reply_prob_max", 50)
 	replyCooldown := optInt(opts, "reply_cooldown")
+	botPeers := map[int64]bool{}
+	for _, part := range strings.Split(toString(opts["bot_peers"]), ",") {
+		if id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64); err == nil && id != 0 {
+			botPeers[id] = true
+		}
+	}
+
 	emojiLikeDef, _ := opts["emoji_like_id"].(string)
 
 	personaVoices := map[string]string{}
@@ -357,6 +413,9 @@ func New(opts map[string]any) (core.Platform, error) {
 		replyProbMin:          replyProbMin,
 		replyProbMax:          replyProbMax,
 		replyCooldown:         replyCooldown,
+		botPeers:              botPeers,
+		observed:              map[int64]*observedBot{},
+		seenNames:             map[int64]string{},
 		emojiLikeDef:          emojiLikeDef,
 		cronJobs:              cronJobs,
 		recentMessages:        make(map[int64]*recallEntry),
@@ -532,7 +591,25 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		return
 	}
 
+	// Extract sender info early: needed both for the observation below and for the
+	// message context further down.
+	var userName string
+	if sender, ok := payload["sender"].(map[string]any); ok {
+		card, _ := sender["card"].(string)
+		nick, _ := sender["nickname"].(string)
+		if card != "" {
+			userName = card
+		} else {
+			userName = nick
+		}
+	}
+
 	if !p.isAllowed(userID) {
+		// Strangers are never answered, but their traffic is how we learn what the
+		// other bots in this group can do — see observe().
+		if msgType == "group" {
+			p.observe(payload, userID, userName)
+		}
 		return
 	}
 
@@ -551,18 +628,6 @@ func (p *Platform) handleMessage(payload map[string]any) {
 	// If require_at is set, only respond to group messages that @ the bot
 	if p.requireAt && msgType == "group" && !p.isBotMentioned(payload) {
 		return
-	}
-
-	// Extract sender info
-	var userName string
-	if sender, ok := payload["sender"].(map[string]any); ok {
-		card, _ := sender["card"].(string)
-		nick, _ := sender["nickname"].(string)
-		if card != "" {
-			userName = card
-		} else {
-			userName = nick
-		}
 	}
 
 	// Parse message content from CQ message array or raw_message
@@ -605,6 +670,16 @@ func (p *Platform) handleMessage(payload map[string]any) {
 	// from "only private" is possible from a group and vice versa.
 	if isCommand(text, "/scope") {
 		p.handleScopeCommand(rctx, userID, text)
+		return
+	}
+
+	// Admin commands around bot-peer traffic. Both return before the throttle.
+	if isCommand(text, "/game") {
+		p.handleGameCommand(rctx, userID, text, groupID)
+		return
+	}
+	if isCommand(text, "/bots") {
+		p.handleBotsCommand(rctx, userID)
 		return
 	}
 
@@ -665,10 +740,23 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		p.handler(p, newMsg)
 		return
 	}
+	// Bot peers are answered only while a game with them is running. That keeps two
+	// bots from chatting indefinitely and keeps every other bot quiet mid-game.
+	peerTurn := false
+	if msgType == "group" && p.botPeers[userID] {
+		if peer, active := p.gamePeer(groupID); active && peer == userID && p.takePeerTurn(groupID) {
+			peerTurn = true
+		} else {
+			slog.Debug("qq: ignoring bot message outside an active game",
+				"group", groupID, "user", userID)
+			return
+		}
+	}
+
 	// Throttling for group messages that did not address the bot. Being
 	// @-mentioned answers 100% of the time and leaves this state untouched, so a
 	// direct question neither spends nor resets the ambient reply budget.
-	if msgType == "group" && !control && !p.isBotMentioned(payload) && p.replyProbability > 0 {
+	if !peerTurn && msgType == "group" && !control && !p.isBotMentioned(payload) && p.replyProbability > 0 {
 		if len(images) > 0 || audio != nil {
 			// Attachments never roll the dice: a dropped picture or recording is
 			// gone for good, since the backlog holds text only. They do observe the
@@ -852,6 +940,7 @@ func (p *Platform) handlePoke(payload map[string]any) {
 
 func (p *Platform) parseMessage(payload map[string]any) (string, []core.ImageAttachment, *core.AudioAttachment, bool) {
 	var textParts []string
+	var mdTexts []string
 	var images []core.ImageAttachment
 	var audio *core.AudioAttachment
 	fromVoice := false
@@ -872,8 +961,29 @@ func (p *Platform) parseMessage(payload map[string]any) (string, []core.ImageAtt
 
 			switch segType {
 			case "text":
-				if text, ok := data["text"].(string); ok {
+				if text, ok := data["text"].(string); ok && !echoesMarkdown(mdTexts, text) {
 					textParts = append(textParts, text)
+				}
+			case "markdown":
+				// Bot replies on QQ often arrive as a markdown element whose body
+				// (and any inline links) is lost if we ignore the segment. These
+				// replies also embed generated images as ![图片](url) inline, so
+				// pull those out and download them like a normal image segment.
+				if content, ok := data["content"].(string); ok {
+					text, urls := markdownParts(content)
+					if text != "" {
+						mdTexts = append(mdTexts, text)
+						textParts = append(textParts, text)
+					}
+					for _, u := range urls {
+						textParts = append(textParts, "[图片]")
+						img, ok := p.fetchImage(map[string]any{"url": u}, chatKind(payload))
+						if !ok {
+							textParts[len(textParts)-1] = "[图片(加载失败)]"
+							continue
+						}
+						images = append(images, img)
+					}
 				}
 			case "image":
 				// Mark the position so the prompt says an image was attached, the
@@ -1001,6 +1111,37 @@ func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error
 		}
 	}
 
+	// [game:start:<uid>] / [game:end] toggle bot-peer traffic for this group. They
+	// are stripped from the outgoing text like the other markers.
+	if m := gameStartMarker.FindStringSubmatch(cleanContent); m != nil {
+		if uid, err := strconv.ParseInt(m[1], 10, 64); err == nil {
+			p.setGame(rctx.groupID, uid)
+			cleanContent = strings.TrimSpace(gameStartMarker.ReplaceAllString(cleanContent, ""))
+			slog.Info("qq: game started", "group", rctx.groupID, "peer", uid)
+		}
+	}
+	if gameEndMarker.MatchString(cleanContent) {
+		p.clearGame(rctx.groupID)
+		cleanContent = strings.TrimSpace(gameEndMarker.ReplaceAllString(cleanContent, ""))
+		slog.Info("qq: game ended", "group", rctx.groupID)
+	}
+	// Addressing a bot peer is itself enough to arm the exchange: the model often
+	// forgets the [game:start:<uid>] marker, and without it the peer's reply is
+	// silently dropped — the game then never advances on its own.
+	if rctx.messageType == "group" {
+		if uid, ok := p.botPeerMention(cleanContent); ok {
+			p.setGame(rctx.groupID, uid)
+			slog.Info("qq: game armed by mention", "group", rctx.groupID, "peer", uid)
+		}
+	}
+
+	// [at:QQ] markers become real mentions. A literal "@名字" in the text is not a
+	// mention to QQ, and other bots only react to an at-segment.
+	messageValue := any(cleanContent)
+	if segs, ok := atSegments(cleanContent); ok {
+		messageValue = segs
+	}
+
 	params := map[string]any{}
 
 	if rctx.messageType == "group" {
@@ -1008,12 +1149,18 @@ func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error
 
 		// Send as reply with quote
 		if p.replyWithQuote && rctx.messageID != 0 {
-			params["message"] = []map[string]any{
+			segments := []map[string]any{
 				{"type": "reply", "data": map[string]any{"id": strconv.FormatInt(int64(rctx.messageID), 10)}},
-				{"type": "text", "data": map[string]any{"text": cleanContent}},
 			}
+			switch v := messageValue.(type) {
+			case string:
+				segments = append(segments, map[string]any{"type": "text", "data": map[string]any{"text": v}})
+			case []map[string]any:
+				segments = append(segments, v...)
+			}
+			params["message"] = segments
 		} else {
-			params["message"] = cleanContent
+			params["message"] = messageValue
 		}
 		_, err := p.callAPI("send_group_msg", params)
 		if err == nil && p.emojiLike && emojiID != "" && rctx.messageID != 0 {
@@ -1023,9 +1170,60 @@ func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error
 	}
 
 	params["user_id"] = rctx.userID
-	params["message"] = cleanContent
+	params["message"] = messageValue
 	_, err := p.callAPI("send_private_msg", params)
 	return err
+}
+
+// atMarker matches the inline [at:QQ] marker the agent writes to mention someone.
+var atMarker = regexp.MustCompile(`\[at:(\d+)\]`)
+
+// Game markers toggle bot-peer traffic; see gameState.
+var (
+	gameStartMarker = regexp.MustCompile(`\[game:start:(\d+)\]`)
+	gameEndMarker   = regexp.MustCompile(`\[game:end\]`)
+)
+
+// botPeerMention returns the first mentioned uid that is a configured bot peer.
+func (p *Platform) botPeerMention(content string) (int64, bool) {
+	for _, m := range atMarker.FindAllStringSubmatch(content, -1) {
+		uid, err := strconv.ParseInt(m[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		if p.botPeers[uid] {
+			return uid, true
+		}
+	}
+	return 0, false
+}
+
+// atSegments splits content into text and at segments. ok is false when the text
+// carries no marker, so the common case keeps sending a plain string.
+func atSegments(content string) ([]map[string]any, bool) {
+	matches := atMarker.FindAllStringSubmatchIndex(content, -1)
+	if len(matches) == 0 {
+		return nil, false
+	}
+	segments := make([]map[string]any, 0, 2*len(matches))
+	pos := 0
+	for _, m := range matches {
+		if m[0] > pos {
+			segments = append(segments, map[string]any{
+				"type": "text", "data": map[string]any{"text": content[pos:m[0]]},
+			})
+		}
+		segments = append(segments, map[string]any{
+			"type": "at", "data": map[string]any{"qq": content[m[2]:m[3]]},
+		})
+		pos = m[1]
+	}
+	if pos < len(content) {
+		segments = append(segments, map[string]any{
+			"type": "text", "data": map[string]any{"text": content[pos:]},
+		})
+	}
+	return segments, true
 }
 
 // SendImage sends an image to the conversation.
@@ -1439,7 +1637,170 @@ func (p *Platform) personaFor(sessionKey string) string {
 }
 
 func (p *Platform) makeGroupExtraContent(sessionKey string) string {
-	return "[群聊消息][" + p.personaFor(sessionKey) + "][" + timeContext() + "]"
+	extra := "[群聊消息][" + p.personaFor(sessionKey) + "][" + timeContext() + "]"
+	if hint := p.observedBotsHint(); hint != "" {
+		extra += hint
+	}
+	return extra
+}
+
+// observedBotsHint summarises what we learned about other bots, so the agent knows
+// how to use them without that being hardcoded in the prompt.
+func (p *Platform) observedBotsHint() string {
+	p.observedMu.Lock()
+	defer p.observedMu.Unlock()
+	if len(p.observed) == 0 {
+		return ""
+	}
+	type entry struct {
+		uid int64
+		ob  *observedBot
+	}
+	entries := make([]entry, 0, len(p.observed))
+	for uid, ob := range p.observed {
+		entries = append(entries, entry{uid, ob})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ob.lastSeen.After(entries[j].ob.lastSeen) })
+	if len(entries) > 3 {
+		entries = entries[:3]
+	}
+	parts := make([]string, 0, len(entries))
+	for _, e := range entries {
+		name := p.seenNames[e.uid]
+		if name == "" {
+			name = strconv.FormatInt(e.uid, 10)
+		}
+		parts = append(parts, fmt.Sprintf("%s(%d)「%s」", name, e.uid, e.ob.command))
+	}
+	return "[本群其他机器人：" + strings.Join(parts, "；") + "]"
+}
+
+// observe learns which command targets which bot from traffic we do not answer.
+// It must never reply: it only records.
+func (p *Platform) observe(payload map[string]any, userID int64, userName string) {
+	segs, _ := payload["message"].([]any)
+	if len(segs) == 0 {
+		return
+	}
+	p.observedMu.Lock()
+	defer p.observedMu.Unlock()
+
+	if userName != "" {
+		p.seenNames[userID] = userName
+	}
+	for i, seg := range segs {
+		s, ok := seg.(map[string]any)
+		if !ok || s["type"] != "at" {
+			continue
+		}
+		data, _ := s["data"].(map[string]any)
+		qq, _ := data["qq"].(string)
+		target, err := strconv.ParseInt(qq, 10, 64)
+		if err != nil || target == 0 || target == p.selfID {
+			continue
+		}
+		// The command is the first text segment right after the mention.
+		for _, next := range segs[i+1:] {
+			n, ok := next.(map[string]any)
+			if !ok || n["type"] != "text" {
+				continue
+			}
+			nd, _ := n["data"].(map[string]any)
+			t, _ := nd["text"].(string)
+			t = strings.TrimSpace(t)
+			if t == "" {
+				continue
+			}
+			if !strings.HasPrefix(t, "/") {
+				break
+			}
+			cmd := strings.Fields(t)[0]
+			if ob, ok := p.observed[target]; ok {
+				ob.command = cmd
+				ob.lastSeen = time.Now()
+			} else {
+				if len(p.observed) >= maxObservedBots {
+					p.evictOldestObservedLocked()
+				}
+				p.observed[target] = &observedBot{command: cmd, lastSeen: time.Now()}
+			}
+			break
+		}
+	}
+}
+
+func (p *Platform) evictOldestObservedLocked() {
+	var oldestUID int64
+	var oldest time.Time
+	for uid, ob := range p.observed {
+		if oldest.IsZero() || ob.lastSeen.Before(oldest) {
+			oldest, oldestUID = ob.lastSeen, uid
+		}
+	}
+	delete(p.observed, oldestUID)
+}
+
+// gameStatus reports an active game without extending it.
+func (p *Platform) gameStatus(groupID int64) (int64, time.Duration, bool) {
+	p.gameMu.Lock()
+	defer p.gameMu.Unlock()
+	raw, ok := p.games.Load(groupID)
+	if !ok {
+		return 0, 0, false
+	}
+	g := raw.(*gameState)
+	if time.Now().After(g.expiresAt) {
+		p.games.Delete(groupID)
+		return 0, 0, false
+	}
+	return g.peer, time.Until(g.expiresAt), true
+}
+
+// handleGameCommand lets an admin inspect or end the active bot game.
+func (p *Platform) handleGameCommand(rctx *replyContext, userID int64, text string, groupID int64) {
+	reply := func(msg string) {
+		if err := p.Reply(context.Background(), rctx, msg); err != nil {
+			slog.Warn("qq: reply to /game failed", "error", err)
+		}
+	}
+	if !p.isAdmin(userID) {
+		reply("❌ 只有管理员能操作游戏状态。")
+		return
+	}
+	arg := strings.TrimSpace(strings.TrimSpace(text)[len("/game"):])
+	switch arg {
+	case "end", "stop", "结束":
+		p.clearGame(groupID)
+		reply("✅ 游戏已结束，机器人只理会人类了。")
+	case "":
+		if peer, left, ok := p.gameStatus(groupID); ok {
+			reply(fmt.Sprintf("🎮 正在和 %d 玩（%d 分钟后自动结束）。发 /game end 可手动结束。",
+				peer, int(left.Minutes())))
+		} else {
+			reply("当前没有进行中的游戏。")
+		}
+	default:
+		reply("用法：/game 查看状态，/game end 结束。")
+	}
+}
+
+// handleBotsCommand dumps what we passively learned about other bots.
+func (p *Platform) handleBotsCommand(rctx *replyContext, userID int64) {
+	reply := func(msg string) {
+		if err := p.Reply(context.Background(), rctx, msg); err != nil {
+			slog.Warn("qq: reply to /bots failed", "error", err)
+		}
+	}
+	if !p.isAdmin(userID) {
+		reply("❌ 只有管理员能查看。")
+		return
+	}
+	hint := p.observedBotsHint()
+	if hint == "" {
+		reply("还没观察到别的机器人的用法。")
+		return
+	}
+	reply("学到的机器人：" + hint)
 }
 
 // timeContext renders the current local time so the agent has a clock. Without it
@@ -2003,7 +2364,65 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 	return &replyContext{messageType: "private", userID: uid}, nil
 }
 
+// takePeerTurn admits one exchange with a bot peer, refusing when it answered too
+// recently (a tight loop rather than a conversation). The overall volume is bounded
+// by the game state instead of a round counter.
+func (p *Platform) takePeerTurn(groupID int64) bool {
+	p.peerMu.Lock()
+	defer p.peerMu.Unlock()
+
+	raw, _ := p.peerChains.LoadOrStore(groupID, &peerChain{})
+	chain := raw.(*peerChain)
+	now := time.Now()
+	if !chain.lastAt.IsZero() && now.Sub(chain.lastAt) < peerMinGap {
+		return false
+	}
+	chain.lastAt = now
+	return true
+}
+
+// setGame marks a game with peer as active in this group.
+func (p *Platform) setGame(groupID, peer int64) {
+	if groupID == 0 || peer == 0 {
+		return
+	}
+	p.gameMu.Lock()
+	defer p.gameMu.Unlock()
+	p.games.Store(groupID, &gameState{peer: peer, expiresAt: time.Now().Add(gameTTL)})
+}
+
+// clearGame ends any game in this group.
+func (p *Platform) clearGame(groupID int64) {
+	p.gameMu.Lock()
+	defer p.gameMu.Unlock()
+	p.games.Delete(groupID)
+}
+
+// gamePeer returns the peer of an active game and extends its lifetime, so an
+// ongoing game does not expire mid-way.
+func (p *Platform) gamePeer(groupID int64) (int64, bool) {
+	p.gameMu.Lock()
+	defer p.gameMu.Unlock()
+	raw, ok := p.games.Load(groupID)
+	if !ok {
+		return 0, false
+	}
+	g := raw.(*gameState)
+	if time.Now().After(g.expiresAt) {
+		p.games.Delete(groupID)
+		slog.Info("qq: game expired, ignoring bot traffic again", "group", groupID, "peer", g.peer)
+		return 0, false
+	}
+	g.expiresAt = time.Now().Add(gameTTL)
+	return g.peer, true
+}
+
 func (p *Platform) isAllowed(userID int64) bool {
+	if p.botPeers[userID] {
+		// A configured bot peer is admitted so a game with it can be played; its
+		// volume is bounded separately by the peer chain, not by allow_from.
+		return true
+	}
 	if p.allowFrom == "" || p.allowFrom == "*" {
 		return true
 	}
@@ -2150,6 +2569,49 @@ func truncateText(s string, n int) string {
 		return s
 	}
 	return string(runes[:n]) + "..."
+}
+
+// markdownParts flattens a QQ markdown segment into readable text and returns the
+// image URLs embedded in it (`![\u56fe\u7247](url)` \u2014 bots put their generated images
+// inline). The payload is percent-encoded, links carry mqqapi:// targets that mean
+// nothing to the model, and QQ prefixes a JSON protocol header.
+func markdownParts(content string) (string, []string) {
+	if unescaped, err := url.PathUnescape(content); err == nil {
+		content = unescaped
+	}
+	var images []string
+	content = markdownImage.ReplaceAllStringFunc(content, func(m string) string {
+		if sub := markdownImage.FindStringSubmatch(m); len(sub) == 3 {
+			images = append(images, sub[2])
+		}
+		return ""
+	})
+	// [label](target) -> label; this also eats the `[]({...})` protocol header.
+	content = markdownLink.ReplaceAllString(content, "$1")
+	content = strings.NewReplacer("**", "", "`", "", "\u200b", "").Replace(content)
+	return strings.TrimSpace(content), images
+}
+
+var (
+	markdownLink  = regexp.MustCompile(`\[([^\]]*)\]\([^)]*\)`)
+	markdownImage = regexp.MustCompile(`!\[([^\]]*)\]\(([^)]+)\)`)
+)
+
+// echoesMarkdown reports whether a plain text segment just repeats the body of a
+// markdown segment from the same message. QQ bot replies carry both — the markdown
+// element (mention + inline image) plus a plain text copy — so without this the
+// model would see every line twice.
+func echoesMarkdown(mdTexts []string, text string) bool {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return true
+	}
+	for _, md := range mdTexts {
+		if md == t || strings.HasSuffix(md, t) {
+			return true
+		}
+	}
+	return false
 }
 
 func downloadFile(url string) ([]byte, string, error) {

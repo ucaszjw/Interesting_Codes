@@ -1473,6 +1473,15 @@ app_secret = "your-feishu-app-secret"
 # tool_admin_only = true 会让非管理员进入 tool_non_admin_mode（默认 "plan"，只读、
 # 完全不能用工具）。改成 "dontAsk" 则只跑 agent 的 allowed_tools（比如联网搜索、
 # cc-connect send），其余静默拒绝。注意白名单里的能力是群里所有人共用的。
+# bot_peers: other bots to allow a back-and-forth with (e.g. a guessing game).
+# They bypass allow_from and the reply throttle, but are only answered while a game
+# is active — the agent opens one with [game:start:<uid>] and closes it with
+# [game:end]; it also expires after 10 idle minutes. Answers are at least 3s apart.
+# bot_peers：允许来回收发的机器人（比如一起玩猜谜）。绕过 allow_from 和回复节流，
+# 但只有在「游戏进行中」才回（模型用 [game:start:<uid>] / [game:end] 开关，
+# 10 分钟无动静自动结束），且两次之间至少 3 秒，不会互刷。
+# bot_peers = "3889001246"
+#
 # tool_admin_only = false
 # tool_non_admin_mode = "plan"     # "plan" | "dontAsk" | "default" | "acceptEdits"
 #

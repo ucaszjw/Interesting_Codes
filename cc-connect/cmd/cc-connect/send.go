@@ -43,7 +43,10 @@ func runSend(args []string) {
 		os.Exit(1)
 	}
 
+	// A deadline matters here: this command runs inside an agent turn, so a stalled
+	// server would hang the whole turn (and the session queue behind it) forever.
 	client := &http.Client{
+		Timeout: sendRequestTimeout,
 		Transport: &http.Transport{
 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
 				return net.Dial("unix", sockPath)
@@ -234,6 +237,9 @@ func detectAttachmentMimeType(fileName string, data []byte) string {
 
 // attachmentDownloadTimeout bounds a remote attachment fetch.
 const attachmentDownloadTimeout = 30 * time.Second
+
+// sendRequestTimeout bounds the call to the local API socket.
+const sendRequestTimeout = 120 * time.Second
 
 // httpAttachmentURL reports whether the argument is an http(s) URL to fetch
 // instead of a local path.
