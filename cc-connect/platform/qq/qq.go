@@ -630,6 +630,20 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		return
 	}
 
+	// Private chats run in the owner's work_dir, and the CLI auto-approves
+	// in-workspace edits before any permission prompt exists — no permission-mode
+	// switch can make such a session read-only. Non-admin DMs are dropped here,
+	// before the agent or any attachment download.
+	if msgType != "group" && p.toolAdminOnly && !p.isAdmin(userID) {
+		slog.Info("qq: dropped non-admin private message", "user", userID)
+		p.Reply(context.Background(), &replyContext{
+			messageType: msgType,
+			userID:      userID,
+			messageID:   int32(messageID),
+		}, "私聊只对管理员开放，有事群里说。")
+		return
+	}
+
 	// Parse message content from CQ message array or raw_message
 	text, images, audio, fromVoice := p.parseMessage(payload)
 	if text == "" && len(images) == 0 && audio == nil {
@@ -706,11 +720,8 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		}
 	}
 
-	// If tool_admin_only is set, non-admin users get plan mode (chat only, no tools)
-	var modeOverride string
-	if p.toolAdminOnly && !p.isAdmin(userID) {
-		modeOverride = p.toolNonAdminMode
-	}
+	// If tool_admin_only is set, non-admin users get the restricted mode.
+	modeOverride := p.modeOverrideFor(msgType, userID)
 
 	// Permission replies are the engine's call: only it knows whether a request is
 	// actually pending. All this adapter does is say who is not allowed to
@@ -886,6 +897,12 @@ func (p *Platform) handlePoke(payload map[string]any) {
 		return
 	}
 
+	// Same rule as a private text message: non-admin DMs never reach the agent.
+	if msgType != "group" && p.toolAdminOnly && !p.isAdmin(userID) {
+		slog.Info("qq: dropped non-admin private poke", "user", userID)
+		return
+	}
+
 	var sessionKey string
 	if msgType == "group" {
 		if p.shareSessionInChannel {
@@ -916,10 +933,7 @@ func (p *Platform) handlePoke(payload map[string]any) {
 		extraContent = "[群聊消息]"
 	}
 
-	var modeOverride string
-	if p.toolAdminOnly && !p.isAdmin(userID) {
-		modeOverride = p.toolNonAdminMode
-	}
+	modeOverride := p.modeOverrideFor(msgType, userID)
 
 	msg := &core.Message{
 		SessionKey:   sessionKey,
@@ -2446,6 +2460,21 @@ func (p *Platform) isGroupAllowed(groupID int64) bool {
 		}
 	}
 	return false
+}
+
+// modeOverrideFor returns the per-message permission mode for a non-admin sender.
+// Group chats use the configured tool_non_admin_mode. Private non-admin messages
+// are dropped before this point (see handleMessage/handlePoke); the "plan" branch
+// is only a fallback, since the CLI auto-approves in-workspace edits and a live
+// mode switch alone cannot make a private session read-only.
+func (p *Platform) modeOverrideFor(msgType string, userID int64) string {
+	if !p.toolAdminOnly || p.isAdmin(userID) {
+		return ""
+	}
+	if msgType != "group" {
+		return "plan"
+	}
+	return p.toolNonAdminMode
 }
 
 func (p *Platform) isAdmin(userID int64) bool {

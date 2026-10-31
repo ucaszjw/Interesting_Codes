@@ -1469,10 +1469,17 @@ app_secret = "your-feishu-app-secret"
 # only, no tools at all). Use "dontAsk" to instead run only the agent's
 # allowed_tools — e.g. a web search or `cc-connect send` — and silently deny the
 # rest. Whatever you whitelist there, everyone in the group can trigger it.
+# This setting only governs groups: a non-admin private message is refused with a
+# one-line notice and never reaches the agent, because private chats run in the
+# owner's work_dir and the CLI auto-approves in-workspace edits before any
+# permission prompt exists.
 # tool_admin_only / tool_non_admin_mode：非管理员群成员能碰到什么。
 # tool_admin_only = true 会让非管理员进入 tool_non_admin_mode（默认 "plan"，只读、
 # 完全不能用工具）。改成 "dontAsk" 则只跑 agent 的 allowed_tools（比如联网搜索、
 # cc-connect send），其余静默拒绝。注意白名单里的能力是群里所有人共用的。
+# 这两项只管群聊：非管理员的私聊会被直接拒绝（回一句「私聊只对管理员开放」），
+# 不进入 agent。因为私聊跑在 owner 的 work_dir 里，工作区内的写文件会被 CLI
+# 自动放行、根本不会弹权限请求。
 # bot_peers: other bots to allow a back-and-forth with (e.g. a guessing game).
 # They bypass allow_from and the reply throttle, but are only answered while a game
 # is active — the agent opens one with [game:start:<uid>] and closes it with

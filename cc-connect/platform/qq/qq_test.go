@@ -1696,6 +1696,56 @@ func TestToolNonAdminMode(t *testing.T) {
 	}
 }
 
+// TestNonAdminPrivateChatRefused is the regression test for a group member DMing
+// the bot and getting it to write files into the repo. Private chats run in the
+// owner's work_dir and the CLI auto-approves in-workspace edits, so a non-admin DM
+// must never reach the agent.
+func TestNonAdminPrivateChatRefused(t *testing.T) {
+	got := make(chan *core.Message, 4)
+	_, f := startQQ(t, map[string]any{
+		"tool_admin_only":     true,
+		"admin_ids":           "999",
+		"tool_non_admin_mode": "dontAsk",
+		"allow_from":          "200,999",
+		"reply_probability":   0,
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+
+	f.sendEvent(t, textEvent("private", 200, "你部署一下这篇论文"))
+
+	select {
+	case m := <-got:
+		t.Fatalf("non-admin private message reached the agent: %q", m.Content)
+	case <-time.After(500 * time.Millisecond):
+	}
+	params := f.sentParams()
+	if len(params) != 1 {
+		t.Fatalf("got %d replies, want 1: %v", len(params), params)
+	}
+	if msg, _ := params[0]["message"].(string); !strings.Contains(msg, "私聊只对管理员开放") {
+		t.Errorf("reply = %q", params[0]["message"])
+	}
+}
+
+func TestModeOverrideFor(t *testing.T) {
+	p := &Platform{toolAdminOnly: true, toolNonAdminMode: "dontAsk", adminIDs: "999"}
+	for _, tc := range []struct {
+		name    string
+		msgType string
+		userID  int64
+		want    string
+	}{
+		{"non-admin private fallback", "private", 200, "plan"},
+		{"non-admin group uses configured mode", "group", 200, "dontAsk"},
+		{"admin is unrestricted", "private", 999, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := p.modeOverrideFor(tc.msgType, tc.userID); got != tc.want {
+				t.Errorf("modeOverrideFor = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestThrottledImageIsDeferredNotDropped is the regression test for a group member
 // asking "这图是啥" and being told "我这边只收到一行「[图片]」，没图可看": an image that
 // lost the cooldown used to be discarded, leaving only its text marker in the
