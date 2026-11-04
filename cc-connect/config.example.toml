@@ -1430,16 +1430,19 @@ app_secret = "your-feishu-app-secret"
 #                                  # 工具权限仍由 tool_admin_only 约束。
 # moderation_groups: opt-in groups where the bot, acting as a group admin, may mute,
 #   unmute, or recall on its own. The agent decides from the conversation and writes
-#   [mute:QQ:minutes], [unmute:QQ] or [recall] in its reply; the adapter strips the
-#   marker, validates the target (must have spoken recently, never an admin/owner —
-#   unless the bot itself owns the group, in which case it outranks them) and
-#   enforces the hourly budget. Empty = off.
+#   [mute:QQ:minutes], [unmute:QQ], [recall], [setadmin:QQ] or [unsetadmin:QQ] in
+#   its reply; the adapter strips the marker and validates the target (must be a
+#   member; never an admin/owner unless the bot itself owns the group, in which case
+#   it outranks them, and never an admin_ids operator). Admin changes additionally
+#   require the bot to be group owner and the request to come from admin_ids.
+#   Empty = off.
 # moderation_groups：开启自动群管的群号（逗号分隔）。模型根据聊天内容自行判断，
-#   在回复里写 [mute:QQ号:分钟] / [unmute:QQ号] / [recall]；适配器负责去掉标记、
-#   校验目标（必须是近期发过言的人，且不能是管理员/群主）并执行限流。留空 = 关闭。
+#   在回复里写 [mute:QQ号:分钟] / [unmute:QQ号] / [recall] / [setadmin:QQ号] /
+#   [unsetadmin:QQ号]；适配器负责去掉标记并校验目标（必须是群成员；bot 是管理员时
+#   不能动管理员/群主，是群主时可以；admin_ids 里的操作者永远不能被禁言）。
+#   设置/取消群管理还要求 bot 是群主，且必须由 admin_ids 发起。留空 = 关闭。
 # moderation_groups = "123456789"
 # moderation_mute_max_minutes = 10   # per-action mute cap / 单次禁言时长上限（分钟）
-# moderation_actions_per_hour = 5    # per-group hourly budget / 每群每小时最多操作次数
 # share_session_in_channel = false  # If true, all users in a group share one agent session / 群聊共享会话
 #
 # Voice replies / 语音回复

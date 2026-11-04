@@ -145,14 +145,9 @@ type Platform struct {
 
 	// Autonomous moderation: opt-in per group. The model proposes an action with
 	// markers in its reply; the adapter validates it and calls NapCat's group-admin
-	// APIs. Opt-in and tightly bounded because these actions hit real people.
-	moderationGroups  map[int64]bool
-	muteMaxMinutes    int
-	moderationPerHour int
-	moderationMu      sync.Mutex
-	moderationLog     map[int64][]time.Time // group -> recent action times
-	recentSendersMu   sync.Mutex
-	recentSenders     map[int64]map[int64]time.Time // group -> uid -> last spoke
+	// APIs. Opt-in because these actions hit real people.
+	moderationGroups map[int64]bool
+	muteMaxMinutes   int
 }
 
 // peerChain tracks the pacing of one bot-to-bot conversation.
@@ -359,10 +354,6 @@ func New(opts map[string]any) (core.Platform, error) {
 	if muteMaxMinutes <= 0 {
 		muteMaxMinutes = 10
 	}
-	moderationPerHour := optIntOr(opts, "moderation_actions_per_hour", 5)
-	if moderationPerHour < 0 {
-		moderationPerHour = 0
-	}
 
 	emojiLikeDef, _ := opts["emoji_like_id"].(string)
 
@@ -445,9 +436,6 @@ func New(opts map[string]any) (core.Platform, error) {
 		seenNames:             map[int64]string{},
 		moderationGroups:      moderationGroups,
 		muteMaxMinutes:        muteMaxMinutes,
-		moderationPerHour:     moderationPerHour,
-		moderationLog:         map[int64][]time.Time{},
-		recentSenders:         map[int64]map[int64]time.Time{},
 		emojiLikeDef:          emojiLikeDef,
 		cronJobs:              cronJobs,
 		recentMessages:        make(map[int64]*recallEntry),
@@ -650,10 +638,6 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		return
 	}
 
-	if msgType == "group" {
-		p.noteRecentSender(groupID, userID)
-	}
-
 	// Chat scope: drop chats the bot is not answering in. Text is read without
 	// downloading attachments so ignored chats cost nothing.
 	if p.scopeBlocks(msgType, rawTextOf(payload)) {
@@ -685,6 +669,7 @@ func (p *Platform) handleMessage(payload map[string]any) {
 	if text == "" && len(images) == 0 && audio == nil {
 		return
 	}
+	text = sanitizeIncomingText(text)
 
 	var sessionKey string
 	if msgType == "group" {
@@ -1126,6 +1111,43 @@ func (p *Platform) parseMessage(payload map[string]any) (string, []core.ImageAtt
 	return strings.TrimSpace(strings.Join(textParts, "")), images, audio, fromVoice
 }
 
+// senderHeaderRE matches a user-typed imitation of our "nickname(QQ):" header.
+var senderHeaderRE = regexp.MustCompile(`([^\s()（）\[\]]{1,32})\s*[(（]\s*(\d{5,12})\s*[)）]\s*[:：]`)
+
+// incomingEscapes neutralises markers that are only meaningful when the adapter
+// writes them. A member typing them must not look like a system directive.
+var incomingEscapes = strings.NewReplacer(
+	"[群管]", "［群管］",
+	"[群聊消息]", "［群聊消息］",
+	"[mute:", "［mute：",
+	"[unmute:", "［unmute：",
+	"[setadmin:", "［setadmin：",
+	"[unsetadmin:", "［unsetadmin：",
+	"[recall]", "［recall］",
+	"[game:start:", "［game:start：",
+	"[game:end]", "［game:end］",
+	"[at:", "［at：",
+	"[emoji:", "［emoji：",
+)
+
+// sanitizeIncomingText keeps a member from forging context inside their own
+// message. A line shaped like our "nickname(QQ):" header would let them speak as
+// someone else, so such headers are rewritten to full-width punctuation and every
+// continuation line gets a "↳ " prefix — only the real, adapter-generated header
+// can start a line. Marker text like [群管] is escaped for the same reason.
+func sanitizeIncomingText(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = senderHeaderRE.ReplaceAllString(text, "$1（$2）﹕")
+	text = incomingEscapes.Replace(text)
+	lines := strings.Split(text, "\n")
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) != "" {
+			lines[i] = "↳ " + lines[i]
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 // Reply sends a message as a reply to an incoming message.
 func (p *Platform) Reply(ctx context.Context, replyCtx any, content string) error {
 	return p.Send(ctx, replyCtx, content)
@@ -1255,13 +1277,15 @@ var (
 // Moderation markers the agent may write when it decides, on its own, that a
 // group needs action. Only honoured in groups listed in moderation_groups.
 var (
-	moderationMuteMarker   = regexp.MustCompile(`\[mute:(\d+)(?::(\d+))?\]`)
-	moderationUnmuteMarker = regexp.MustCompile(`\[unmute:(\d+)\]`)
-	moderationRecallMarker = regexp.MustCompile(`\[recall\]`)
+	moderationMuteMarker       = regexp.MustCompile(`\[mute:(\d+)(?::(\d+))?\]`)
+	moderationUnmuteMarker     = regexp.MustCompile(`\[unmute:(\d+)\]`)
+	moderationSetAdminMarker   = regexp.MustCompile(`\[setadmin:(\d+)\]`)
+	moderationUnsetAdminMarker = regexp.MustCompile(`\[unsetadmin:(\d+)\]`)
+	moderationRecallMarker     = regexp.MustCompile(`\[recall\]`)
 )
 
 type moderationAction struct {
-	kind    string // "mute" | "unmute" | "recall"
+	kind    string // "mute" | "unmute" | "setadmin" | "unsetadmin" | "recall"
 	target  int64
 	minutes int
 }
@@ -1285,6 +1309,18 @@ func parseModerationMarkers(content string) (string, []moderationAction) {
 		sub := moderationUnmuteMarker.FindStringSubmatch(m)
 		uid, _ := strconv.ParseInt(sub[1], 10, 64)
 		actions = append(actions, moderationAction{kind: "unmute", target: uid})
+		return ""
+	})
+	content = moderationSetAdminMarker.ReplaceAllStringFunc(content, func(m string) string {
+		sub := moderationSetAdminMarker.FindStringSubmatch(m)
+		uid, _ := strconv.ParseInt(sub[1], 10, 64)
+		actions = append(actions, moderationAction{kind: "setadmin", target: uid})
+		return ""
+	})
+	content = moderationUnsetAdminMarker.ReplaceAllStringFunc(content, func(m string) string {
+		sub := moderationUnsetAdminMarker.FindStringSubmatch(m)
+		uid, _ := strconv.ParseInt(sub[1], 10, 64)
+		actions = append(actions, moderationAction{kind: "unsetadmin", target: uid})
 		return ""
 	})
 	content = moderationRecallMarker.ReplaceAllStringFunc(content, func(string) string {
@@ -1313,9 +1349,48 @@ func (p *Platform) runModerationAction(rctx *replyContext, a moderationAction) e
 	switch a.kind {
 	case "mute", "unmute":
 		return p.moderateMute(rctx, a)
+	case "setadmin", "unsetadmin":
+		return p.moderateAdmin(rctx, a)
 	case "recall":
 		return p.moderateRecall(rctx)
 	}
+	return nil
+}
+
+// moderateAdmin grants or revokes group-admin rights. Only the group owner can do
+// this, and only at the operator's explicit request: a member must not be able to
+// talk the bot into promoting them.
+func (p *Platform) moderateAdmin(rctx *replyContext, a moderationAction) error {
+	groupID := rctx.groupID
+	if !p.isAdmin(rctx.userID) {
+		return fmt.Errorf("只有管理员能调整群管理")
+	}
+	if !p.botIsGroupOwner(groupID) {
+		return fmt.Errorf("只有群主能调整群管理")
+	}
+	if a.target == 0 || a.target == p.selfID {
+		return fmt.Errorf("目标无效")
+	}
+	role, err := p.groupMemberRole(groupID, a.target)
+	if err != nil {
+		return fmt.Errorf("查不到这个群成员")
+	}
+	if role == "owner" {
+		return fmt.Errorf("不能调整群主")
+	}
+	if a.kind == "unsetadmin" && p.isAdmin(a.target) {
+		return fmt.Errorf("不能取消操作者的管理")
+	}
+	enable := a.kind == "setadmin"
+	if _, err := p.callAPI("set_group_admin", map[string]any{
+		"group_id": groupID,
+		"user_id":  a.target,
+		"enable":   enable,
+	}); err != nil {
+		action := map[bool]string{true: "设置", false: "取消"}[enable]
+		return fmt.Errorf("%s群管理失败：%v", action, err)
+	}
+	slog.Info("qq: moderation", "group", groupID, "action", a.kind, "target", a.target)
 	return nil
 }
 
@@ -1327,12 +1402,14 @@ func (p *Platform) moderateMute(rctx *replyContext, a moderationAction) error {
 	if a.target == 0 || a.target == p.selfID {
 		return fmt.Errorf("目标无效")
 	}
-	// A group owner outranks everyone, so the rank checks only apply when the bot
-	// is merely an admin. It still never mutes the bot itself or the operator.
-	botIsOwner := p.botIsGroupOwner(groupID)
-	if !botIsOwner && p.isAdmin(a.target) {
-		return fmt.Errorf("不能处理管理员")
+	// The operator is never muted, even when the bot owns the group — otherwise a
+	// misfire could lock its own admin out with no way to ask for an unmute.
+	if a.kind == "mute" && p.isAdmin(a.target) {
+		return fmt.Errorf("无法禁言")
 	}
+	// A group owner outranks everyone, so the rank checks only apply when the bot
+	// is merely an admin.
+	botIsOwner := p.botIsGroupOwner(groupID)
 	// Membership is the hard check: it rejects invented QQ numbers, and it tells us
 	// whether the target outranks the bot.
 	role, err := p.groupMemberRole(groupID, a.target)
@@ -1342,16 +1419,6 @@ func (p *Platform) moderateMute(rctx *replyContext, a moderationAction) error {
 	if !botIsOwner && (role == "owner" || role == "admin") {
 		return fmt.Errorf("不能处理群主或管理员")
 	}
-	// The bot's own judgment only covers people it just saw talk. An explicit
-	// request from the owner may name someone who has not spoken recently (or who
-	// spoke before a restart) — the membership check above already keeps that safe.
-	if a.kind == "mute" && !p.recentlyActive(groupID, a.target, 10*time.Minute) && !p.isAdmin(rctx.userID) {
-		return fmt.Errorf("目标最近没在本群发言")
-	}
-	if !p.takeModerationSlot(groupID) {
-		return fmt.Errorf("操作太频繁，先缓一缓")
-	}
-
 	duration := 0
 	if a.kind == "mute" {
 		duration = a.minutes
@@ -1393,9 +1460,6 @@ func (p *Platform) moderateRecall(rctx *replyContext) error {
 	if !p.botIsGroupOwner(rctx.groupID) && p.isAdmin(entry.userID) {
 		return fmt.Errorf("不能撤回管理员的消息")
 	}
-	if !p.takeModerationSlot(rctx.groupID) {
-		return fmt.Errorf("操作太频繁，先缓一缓")
-	}
 	if _, err := p.callAPI("delete_msg", map[string]any{
 		"message_id": rctx.messageID,
 	}); err != nil {
@@ -1426,60 +1490,6 @@ func (p *Platform) groupMemberRole(groupID, userID int64) (string, error) {
 	}
 	role, _ := data["role"].(string)
 	return role, nil
-}
-
-// takeModerationSlot enforces the per-group hourly budget. It returns true when a
-// slot was consumed, so rejected attempts do not burn the budget.
-func (p *Platform) takeModerationSlot(groupID int64) bool {
-	if p.moderationPerHour <= 0 {
-		return true
-	}
-	p.moderationMu.Lock()
-	defer p.moderationMu.Unlock()
-	cutoff := time.Now().Add(-time.Hour)
-	recent := p.moderationLog[groupID]
-	i := 0
-	for _, t := range recent {
-		if t.After(cutoff) {
-			recent[i] = t
-			i++
-		}
-	}
-	recent = recent[:i]
-	if len(recent) >= p.moderationPerHour {
-		p.moderationLog[groupID] = recent
-		return false
-	}
-	p.moderationLog[groupID] = append(recent, time.Now())
-	return true
-}
-
-// noteRecentSender remembers who spoke in a group, so moderation can only target
-// someone actually present instead of an invented QQ number.
-func (p *Platform) noteRecentSender(groupID, userID int64) {
-	p.recentSendersMu.Lock()
-	defer p.recentSendersMu.Unlock()
-	m := p.recentSenders[groupID]
-	if m == nil {
-		m = map[int64]time.Time{}
-		p.recentSenders[groupID] = m
-	}
-	m[userID] = time.Now()
-	if len(m) > 200 {
-		cutoff := time.Now().Add(-10 * time.Minute)
-		for uid, seen := range m {
-			if seen.Before(cutoff) {
-				delete(m, uid)
-			}
-		}
-	}
-}
-
-func (p *Platform) recentlyActive(groupID, userID int64, within time.Duration) bool {
-	p.recentSendersMu.Lock()
-	defer p.recentSendersMu.Unlock()
-	seen, ok := p.recentSenders[groupID][userID]
-	return ok && time.Since(seen) <= within
 }
 
 // botPeerMention returns the first mentioned uid that is a configured bot peer.
