@@ -142,6 +142,17 @@ type Platform struct {
 	observedMu sync.Mutex
 	observed   map[int64]*observedBot
 	seenNames  map[int64]string
+
+	// Autonomous moderation: opt-in per group. The model proposes an action with
+	// markers in its reply; the adapter validates it and calls NapCat's group-admin
+	// APIs. Opt-in and tightly bounded because these actions hit real people.
+	moderationGroups  map[int64]bool
+	muteMaxMinutes    int
+	moderationPerHour int
+	moderationMu      sync.Mutex
+	moderationLog     map[int64][]time.Time // group -> recent action times
+	recentSendersMu   sync.Mutex
+	recentSenders     map[int64]map[int64]time.Time // group -> uid -> last spoke
 }
 
 // peerChain tracks the pacing of one bot-to-bot conversation.
@@ -337,6 +348,22 @@ func New(opts map[string]any) (core.Platform, error) {
 		}
 	}
 
+	// Autonomous moderation is strictly opt-in per group. Empty means off.
+	moderationGroups := map[int64]bool{}
+	for _, part := range strings.Split(toString(opts["moderation_groups"]), ",") {
+		if id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64); err == nil && id != 0 {
+			moderationGroups[id] = true
+		}
+	}
+	muteMaxMinutes := optIntOr(opts, "moderation_mute_max_minutes", 10)
+	if muteMaxMinutes <= 0 {
+		muteMaxMinutes = 10
+	}
+	moderationPerHour := optIntOr(opts, "moderation_actions_per_hour", 5)
+	if moderationPerHour < 0 {
+		moderationPerHour = 0
+	}
+
 	emojiLikeDef, _ := opts["emoji_like_id"].(string)
 
 	personaVoices := map[string]string{}
@@ -416,6 +443,11 @@ func New(opts map[string]any) (core.Platform, error) {
 		botPeers:              botPeers,
 		observed:              map[int64]*observedBot{},
 		seenNames:             map[int64]string{},
+		moderationGroups:      moderationGroups,
+		muteMaxMinutes:        muteMaxMinutes,
+		moderationPerHour:     moderationPerHour,
+		moderationLog:         map[int64][]time.Time{},
+		recentSenders:         map[int64]map[int64]time.Time{},
 		emojiLikeDef:          emojiLikeDef,
 		cronJobs:              cronJobs,
 		recentMessages:        make(map[int64]*recallEntry),
@@ -604,7 +636,7 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		}
 	}
 
-	if !p.isAllowed(userID) {
+	if !p.allowsSender(msgType, groupID, userID) {
 		// Strangers are never answered, but their traffic is how we learn what the
 		// other bots in this group can do — see observe().
 		if msgType == "group" {
@@ -616,6 +648,10 @@ func (p *Platform) handleMessage(payload map[string]any) {
 	// Group allowlist check
 	if groupID != 0 && !p.isGroupAllowed(groupID) {
 		return
+	}
+
+	if msgType == "group" {
+		p.noteRecentSender(groupID, userID)
 	}
 
 	// Chat scope: drop chats the bot is not answering in. Text is read without
@@ -872,7 +908,12 @@ func (p *Platform) handlePoke(payload map[string]any) {
 		return
 	}
 
-	if !p.isAllowed(userID) {
+	msgType := "private"
+	if groupID != 0 {
+		msgType = "group"
+	}
+
+	if !p.allowsSender(msgType, groupID, userID) {
 		return
 	}
 
@@ -886,11 +927,6 @@ func (p *Platform) handlePoke(payload map[string]any) {
 			slog.Debug("qq: ignoring old poke event", "time", int64(ts))
 			return
 		}
-	}
-
-	msgType := "private"
-	if groupID != 0 {
-		msgType = "group"
 	}
 
 	if !p.scopeAllows(msgType) {
@@ -1125,6 +1161,14 @@ func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error
 		}
 	}
 
+	// Moderation markers ([mute:uid:min], [unmute:uid], [recall]) are stripped
+	// everywhere; they only execute in opted-in groups. Failures are appended so
+	// the group is not told an action happened when it did not.
+	cleanContent, modActions := parseModerationMarkers(cleanContent)
+	if notes := p.applyModeration(rctx, modActions); len(notes) > 0 {
+		cleanContent = strings.TrimSpace(cleanContent + "\n（" + strings.Join(notes, "；") + "）")
+	}
+
 	// [game:start:<uid>] / [game:end] toggle bot-peer traffic for this group. They
 	// are stripped from the outgoing text like the other markers.
 	if m := gameStartMarker.FindStringSubmatch(cleanContent); m != nil {
@@ -1147,6 +1191,16 @@ func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error
 			p.setGame(rctx.groupID, uid)
 			slog.Info("qq: game armed by mention", "group", rctx.groupID, "peer", uid)
 		}
+	}
+
+	// A reply consisting only of markers (e.g. a bare [mute:...]) has nothing left
+	// to say. Sending it anyway puts an empty text segment on the wire, which QQ
+	// renders as "[该消息类型暂不支持查看]". The action already ran above.
+	if strings.TrimSpace(cleanContent) == "" {
+		if rctx.messageType == "group" && p.emojiLike && emojiID != "" && rctx.messageID != 0 {
+			p.addEmojiLike(int64(rctx.messageID), emojiID)
+		}
+		return nil
 	}
 
 	// [at:QQ] markers become real mentions. A literal "@名字" in the text is not a
@@ -1197,6 +1251,236 @@ var (
 	gameStartMarker = regexp.MustCompile(`\[game:start:(\d+)\]`)
 	gameEndMarker   = regexp.MustCompile(`\[game:end\]`)
 )
+
+// Moderation markers the agent may write when it decides, on its own, that a
+// group needs action. Only honoured in groups listed in moderation_groups.
+var (
+	moderationMuteMarker   = regexp.MustCompile(`\[mute:(\d+)(?::(\d+))?\]`)
+	moderationUnmuteMarker = regexp.MustCompile(`\[unmute:(\d+)\]`)
+	moderationRecallMarker = regexp.MustCompile(`\[recall\]`)
+)
+
+type moderationAction struct {
+	kind    string // "mute" | "unmute" | "recall"
+	target  int64
+	minutes int
+}
+
+// parseModerationMarkers removes moderation markers from the outgoing text and
+// returns the actions they requested. Markers are stripped everywhere so they can
+// never leak into a chat; only moderation groups execute them (see applyModeration).
+func parseModerationMarkers(content string) (string, []moderationAction) {
+	var actions []moderationAction
+	content = moderationMuteMarker.ReplaceAllStringFunc(content, func(m string) string {
+		sub := moderationMuteMarker.FindStringSubmatch(m)
+		uid, _ := strconv.ParseInt(sub[1], 10, 64)
+		minutes := 0
+		if len(sub) > 2 && sub[2] != "" {
+			minutes, _ = strconv.Atoi(sub[2])
+		}
+		actions = append(actions, moderationAction{kind: "mute", target: uid, minutes: minutes})
+		return ""
+	})
+	content = moderationUnmuteMarker.ReplaceAllStringFunc(content, func(m string) string {
+		sub := moderationUnmuteMarker.FindStringSubmatch(m)
+		uid, _ := strconv.ParseInt(sub[1], 10, 64)
+		actions = append(actions, moderationAction{kind: "unmute", target: uid})
+		return ""
+	})
+	content = moderationRecallMarker.ReplaceAllStringFunc(content, func(string) string {
+		actions = append(actions, moderationAction{kind: "recall"})
+		return ""
+	})
+	return strings.TrimSpace(content), actions
+}
+
+// applyModeration executes model-requested actions and returns short failure notes
+// for the reply. It is a no-op outside opted-in groups.
+func (p *Platform) applyModeration(rctx *replyContext, actions []moderationAction) []string {
+	if len(actions) == 0 || rctx.messageType != "group" || !p.moderationGroups[rctx.groupID] {
+		return nil
+	}
+	var notes []string
+	for _, a := range actions {
+		if err := p.runModerationAction(rctx, a); err != nil {
+			notes = append(notes, err.Error())
+		}
+	}
+	return notes
+}
+
+func (p *Platform) runModerationAction(rctx *replyContext, a moderationAction) error {
+	switch a.kind {
+	case "mute", "unmute":
+		return p.moderateMute(rctx, a)
+	case "recall":
+		return p.moderateRecall(rctx)
+	}
+	return nil
+}
+
+// moderateMute mutes (or, with duration 0, unmutes) one member. Guards are the
+// point here: a hallucinated or manipulated target must not cost anyone their
+// voice, and an admin must not be vulnerable to a bot.
+func (p *Platform) moderateMute(rctx *replyContext, a moderationAction) error {
+	groupID := rctx.groupID
+	if a.target == 0 || a.target == p.selfID {
+		return fmt.Errorf("目标无效")
+	}
+	// A group owner outranks everyone, so the rank checks only apply when the bot
+	// is merely an admin. It still never mutes the bot itself or the operator.
+	botIsOwner := p.botIsGroupOwner(groupID)
+	if !botIsOwner && p.isAdmin(a.target) {
+		return fmt.Errorf("不能处理管理员")
+	}
+	// Membership is the hard check: it rejects invented QQ numbers, and it tells us
+	// whether the target outranks the bot.
+	role, err := p.groupMemberRole(groupID, a.target)
+	if err != nil {
+		return fmt.Errorf("查不到这个群成员")
+	}
+	if !botIsOwner && (role == "owner" || role == "admin") {
+		return fmt.Errorf("不能处理群主或管理员")
+	}
+	// The bot's own judgment only covers people it just saw talk. An explicit
+	// request from the owner may name someone who has not spoken recently (or who
+	// spoke before a restart) — the membership check above already keeps that safe.
+	if a.kind == "mute" && !p.recentlyActive(groupID, a.target, 10*time.Minute) && !p.isAdmin(rctx.userID) {
+		return fmt.Errorf("目标最近没在本群发言")
+	}
+	if !p.takeModerationSlot(groupID) {
+		return fmt.Errorf("操作太频繁，先缓一缓")
+	}
+
+	duration := 0
+	if a.kind == "mute" {
+		duration = a.minutes
+		if duration <= 0 {
+			duration = p.muteMaxMinutes
+		}
+		if duration > p.muteMaxMinutes {
+			duration = p.muteMaxMinutes
+		}
+		duration *= 60
+	}
+	if _, err := p.callAPI("set_group_ban", map[string]any{
+		"group_id": groupID,
+		"user_id":  a.target,
+		"duration": duration,
+	}); err != nil {
+		return fmt.Errorf("%s失败：%v", map[string]string{"mute": "禁言", "unmute": "解禁"}[a.kind], err)
+	}
+	slog.Info("qq: moderation", "group", groupID, "action", a.kind, "target", a.target, "duration_s", duration)
+	return nil
+}
+
+// moderateRecall deletes the message this reply is answering. It refuses when that
+// message came from an admin, so a prompt-injected reply cannot erase the boss.
+func (p *Platform) moderateRecall(rctx *replyContext) error {
+	if rctx.messageID == 0 {
+		return fmt.Errorf("没有可撤回的消息")
+	}
+	p.recentMessagesMu.Lock()
+	entry := p.recentMessages[int64(rctx.messageID)]
+	p.recentMessagesMu.Unlock()
+	if entry == nil {
+		// Without the sender on record we cannot rule out an admin's message.
+		return fmt.Errorf("无法确认要撤回的消息")
+	}
+	if entry.userID == p.selfID {
+		return fmt.Errorf("不能撤回自己的消息")
+	}
+	if !p.botIsGroupOwner(rctx.groupID) && p.isAdmin(entry.userID) {
+		return fmt.Errorf("不能撤回管理员的消息")
+	}
+	if !p.takeModerationSlot(rctx.groupID) {
+		return fmt.Errorf("操作太频繁，先缓一缓")
+	}
+	if _, err := p.callAPI("delete_msg", map[string]any{
+		"message_id": rctx.messageID,
+	}); err != nil {
+		return fmt.Errorf("撤回失败：%v", err)
+	}
+	slog.Info("qq: moderation", "group", rctx.groupID, "action", "recall", "message", rctx.messageID)
+	return nil
+}
+
+// botIsGroupOwner reports whether the bot itself owns the group. Queried per
+// action — moderation is rate-limited, so the extra call is cheap.
+func (p *Platform) botIsGroupOwner(groupID int64) bool {
+	if p.selfID == 0 {
+		return false
+	}
+	role, err := p.groupMemberRole(groupID, p.selfID)
+	return err == nil && role == "owner"
+}
+
+func (p *Platform) groupMemberRole(groupID, userID int64) (string, error) {
+	data, err := p.callAPI("get_group_member_info", map[string]any{
+		"group_id": groupID,
+		"user_id":  userID,
+		"no_cache": true,
+	})
+	if err != nil {
+		return "", err
+	}
+	role, _ := data["role"].(string)
+	return role, nil
+}
+
+// takeModerationSlot enforces the per-group hourly budget. It returns true when a
+// slot was consumed, so rejected attempts do not burn the budget.
+func (p *Platform) takeModerationSlot(groupID int64) bool {
+	if p.moderationPerHour <= 0 {
+		return true
+	}
+	p.moderationMu.Lock()
+	defer p.moderationMu.Unlock()
+	cutoff := time.Now().Add(-time.Hour)
+	recent := p.moderationLog[groupID]
+	i := 0
+	for _, t := range recent {
+		if t.After(cutoff) {
+			recent[i] = t
+			i++
+		}
+	}
+	recent = recent[:i]
+	if len(recent) >= p.moderationPerHour {
+		p.moderationLog[groupID] = recent
+		return false
+	}
+	p.moderationLog[groupID] = append(recent, time.Now())
+	return true
+}
+
+// noteRecentSender remembers who spoke in a group, so moderation can only target
+// someone actually present instead of an invented QQ number.
+func (p *Platform) noteRecentSender(groupID, userID int64) {
+	p.recentSendersMu.Lock()
+	defer p.recentSendersMu.Unlock()
+	m := p.recentSenders[groupID]
+	if m == nil {
+		m = map[int64]time.Time{}
+		p.recentSenders[groupID] = m
+	}
+	m[userID] = time.Now()
+	if len(m) > 200 {
+		cutoff := time.Now().Add(-10 * time.Minute)
+		for uid, seen := range m {
+			if seen.Before(cutoff) {
+				delete(m, uid)
+			}
+		}
+	}
+}
+
+func (p *Platform) recentlyActive(groupID, userID int64, within time.Duration) bool {
+	p.recentSendersMu.Lock()
+	defer p.recentSendersMu.Unlock()
+	seen, ok := p.recentSenders[groupID][userID]
+	return ok && time.Since(seen) <= within
+}
 
 // botPeerMention returns the first mentioned uid that is a configured bot peer.
 func (p *Platform) botPeerMention(content string) (int64, bool) {
@@ -1652,10 +1936,28 @@ func (p *Platform) personaFor(sessionKey string) string {
 
 func (p *Platform) makeGroupExtraContent(sessionKey string) string {
 	extra := "[群聊消息][" + p.personaFor(sessionKey) + "][" + timeContext() + "]"
+	if gid, ok := groupIDFromSessionKey(sessionKey); ok && p.moderationGroups[gid] {
+		extra += "[群管]"
+	}
 	if hint := p.observedBotsHint(); hint != "" {
 		extra += hint
 	}
 	return extra
+}
+
+// groupIDFromSessionKey extracts the group id from both session-key shapes:
+// "qq:g:<gid>" (shared channel session) and "qq:<gid>:<uid>" (per-user session).
+func groupIDFromSessionKey(key string) (int64, bool) {
+	parts := strings.Split(key, ":")
+	if len(parts) != 3 {
+		return 0, false
+	}
+	raw := parts[1]
+	if raw == "g" {
+		raw = parts[2]
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	return id, err == nil
 }
 
 // observedBotsHint summarises what we learned about other bots, so the agent knows
@@ -2443,6 +2745,37 @@ func (p *Platform) isAllowed(userID int64) bool {
 	uid := strconv.FormatInt(userID, 10)
 	for _, allowed := range strings.Split(p.allowFrom, ",") {
 		if strings.TrimSpace(allowed) == uid {
+			return true
+		}
+	}
+	return false
+}
+
+// allowsSender decides whether a sender may talk to the bot. Besides allow_from,
+// an explicitly listed group is a trust boundary: the owner chose to put the bot
+// there, so any member may address it — requiring every member to be listed in
+// allow_from would make adding a group do nothing. Tool access for those members is
+// still bounded by tool_admin_only.
+func (p *Platform) allowsSender(msgType string, groupID, userID int64) bool {
+	if p.isAllowed(userID) {
+		return true
+	}
+	if msgType != "group" || groupID == 0 {
+		return false
+	}
+	return p.groupListedExplicitly(groupID)
+}
+
+// groupListedExplicitly reports whether groupID is named in group_allow. An empty
+// or "*" group_allow means "all groups" and deliberately does NOT imply that every
+// sender in every group is trusted.
+func (p *Platform) groupListedExplicitly(groupID int64) bool {
+	if p.groupAllow == "" || p.groupAllow == "*" {
+		return false
+	}
+	gid := strconv.FormatInt(groupID, 10)
+	for _, allowed := range strings.Split(p.groupAllow, ",") {
+		if strings.TrimSpace(allowed) == gid {
 			return true
 		}
 	}

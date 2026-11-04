@@ -1421,6 +1421,25 @@ app_secret = "your-feishu-app-secret"
 # token = ""                       # optional: access_token / 可选鉴权 token
 # allow_from = "*"                 # allowed QQ user IDs, e.g. "12345,67890" or "*" for all
 #                                  # 允许的 QQ 号，如 "12345,67890"，"*" 表示所有
+# group_allow = "*"                # groups the bot may speak in; "" or "*" = all
+#                                  # A listed group trusts its members: they do not
+#                                  # also need to be in allow_from. Tool access is
+#                                  # still bounded by tool_admin_only.
+#                                  # 允许机器人发言的群号列表；"" 或 "*" 表示所有群。
+#                                  # 列进这里的群，其成员无需再写进 allow_from；
+#                                  # 工具权限仍由 tool_admin_only 约束。
+# moderation_groups: opt-in groups where the bot, acting as a group admin, may mute,
+#   unmute, or recall on its own. The agent decides from the conversation and writes
+#   [mute:QQ:minutes], [unmute:QQ] or [recall] in its reply; the adapter strips the
+#   marker, validates the target (must have spoken recently, never an admin/owner —
+#   unless the bot itself owns the group, in which case it outranks them) and
+#   enforces the hourly budget. Empty = off.
+# moderation_groups：开启自动群管的群号（逗号分隔）。模型根据聊天内容自行判断，
+#   在回复里写 [mute:QQ号:分钟] / [unmute:QQ号] / [recall]；适配器负责去掉标记、
+#   校验目标（必须是近期发过言的人，且不能是管理员/群主）并执行限流。留空 = 关闭。
+# moderation_groups = "123456789"
+# moderation_mute_max_minutes = 10   # per-action mute cap / 单次禁言时长上限（分钟）
+# moderation_actions_per_hour = 5    # per-group hourly budget / 每群每小时最多操作次数
 # share_session_in_channel = false  # If true, all users in a group share one agent session / 群聊共享会话
 #
 # Voice replies / 语音回复

@@ -439,6 +439,9 @@ type fakeOneBot struct {
 	mu   sync.Mutex
 	conn *websocket.Conn
 	sent []map[string]any
+	// Role overrides for get_group_member_info; the bot itself defaults to "member".
+	botRole string
+	roles   map[int64]string
 
 	// gorilla/websocket permits only one concurrent writer, and both the server
 	// handler (API responses) and the test (incoming events) write to this conn.
@@ -480,6 +483,19 @@ func newFakeOneBot(t *testing.T) *fakeOneBot {
 				data = map[string]any{"user_id": fakeBotUserID, "nickname": "TestBot"}
 			case "get_group_info":
 				data = map[string]any{"group_name": "测试群"}
+			case "get_group_member_info":
+				role := "member"
+				params, _ := req["params"].(map[string]any)
+				uid, _ := params["user_id"].(float64)
+				f.mu.Lock()
+				if int64(uid) == fakeBotUserID && f.botRole != "" {
+					role = f.botRole
+				}
+				if r, ok := f.roles[int64(uid)]; ok {
+					role = r
+				}
+				f.mu.Unlock()
+				data = map[string]any{"role": role}
 			default:
 				if params, ok := req["params"].(map[string]any); ok {
 					f.mu.Lock()
@@ -500,6 +516,23 @@ func newFakeOneBot(t *testing.T) *fakeOneBot {
 }
 
 func (f *fakeOneBot) url() string { return "ws" + strings.TrimPrefix(f.ts.URL, "http") }
+
+// setRole overrides the role reported for a member by get_group_member_info.
+func (f *fakeOneBot) setRole(userID int64, role string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.roles == nil {
+		f.roles = map[int64]string{}
+	}
+	f.roles[userID] = role
+}
+
+// setBotRole overrides the role reported for the bot itself.
+func (f *fakeOneBot) setBotRole(role string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.botRole = role
+}
 
 func (f *fakeOneBot) sendEvent(t *testing.T, event map[string]any) {
 	t.Helper()
@@ -1724,6 +1757,302 @@ func TestNonAdminPrivateChatRefused(t *testing.T) {
 	if msg, _ := params[0]["message"].(string); !strings.Contains(msg, "私聊只对管理员开放") {
 		t.Errorf("reply = %q", params[0]["message"])
 	}
+}
+
+// TestListedGroupAdmitsMembers: adding a group to group_allow must be enough to
+// make the bot answer there; requiring every member in allow_from made listing the
+// group a no-op at runtime.
+func TestListedGroupAdmitsMembers(t *testing.T) {
+	got := make(chan *core.Message, 4)
+	_, f := startQQ(t, map[string]any{
+		"group_allow":         "100",
+		"allow_from":          "999",
+		"tool_admin_only":     true,
+		"admin_ids":           "999",
+		"tool_non_admin_mode": "dontAsk",
+		"reply_probability":   0,
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+
+	f.sendEvent(t, textEvent("group", 200, "群里冒个泡"))
+
+	select {
+	case m := <-got:
+		if m.ModeOverride != "dontAsk" {
+			t.Errorf("ModeOverride = %q, want dontAsk for a non-admin group member", m.ModeOverride)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("member of a listed group was not answered")
+	}
+}
+
+func TestUnlistedGroupRejectsMembers(t *testing.T) {
+	got := make(chan *core.Message, 4)
+	_, f := startQQ(t, map[string]any{
+		"group_allow":       "100",
+		"allow_from":        "999",
+		"reply_probability": 0,
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+
+	event := textEvent("group", 200, "别的群冒个泡")
+	event["group_id"] = int64(101)
+	f.sendEvent(t, event)
+
+	select {
+	case m := <-got:
+		t.Fatalf("message from an unlisted group reached the agent: %q", m.Content)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+func TestParseModerationMarkers(t *testing.T) {
+	clean, actions := parseModerationMarkers("别刷屏了 [mute:12345:5] 冷静一下 [unmute:678] [recall]")
+	for _, marker := range []string{"[mute:", "[unmute:", "[recall]"} {
+		if strings.Contains(clean, marker) {
+			t.Errorf("marker %q leaked into %q", marker, clean)
+		}
+	}
+	if len(actions) != 3 {
+		t.Fatalf("got %d actions, want 3: %+v", len(actions), actions)
+	}
+	if actions[0] != (moderationAction{kind: "mute", target: 12345, minutes: 5}) {
+		t.Errorf("first action = %+v", actions[0])
+	}
+	if actions[1] != (moderationAction{kind: "unmute", target: 678}) {
+		t.Errorf("second action = %+v", actions[1])
+	}
+	if actions[2].kind != "recall" {
+		t.Errorf("third action = %+v", actions[2])
+	}
+}
+
+func sentBanParams(f *fakeOneBot) []map[string]any {
+	var out []map[string]any
+	for _, p := range f.sentParams() {
+		if _, ok := p["duration"]; ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func sentTexts(f *fakeOneBot) []string {
+	var out []string
+	for _, p := range f.sentParams() {
+		if msg, ok := p["message"].(string); ok {
+			out = append(out, msg)
+		}
+	}
+	return out
+}
+
+func TestAutonomousMuteInConfiguredGroup(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"moderation_groups":           "100",
+		"moderation_mute_max_minutes": int64(10),
+		"admin_ids":                   "999",
+	}, nil)
+	plat.noteRecentSender(100, 200)
+
+	if err := plat.Send(context.Background(), &replyContext{messageType: "group", groupID: 100},
+		"[mute:200:60] 刷屏了，冷静一下"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	bans := sentBanParams(f)
+	if len(bans) != 1 {
+		t.Fatalf("got %d ban calls, want 1", len(bans))
+	}
+	if bans[0]["duration"] != float64(600) {
+		t.Errorf("duration = %v, want 600s (capped at 10 minutes)", bans[0]["duration"])
+	}
+	for _, text := range sentTexts(f) {
+		if strings.Contains(text, "[mute:") {
+			t.Errorf("marker leaked into sent text: %q", text)
+		}
+	}
+}
+
+func TestModerationOffInUnconfiguredGroup(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"moderation_groups": "100",
+		"admin_ids":         "999",
+	}, nil)
+	plat.noteRecentSender(101, 200)
+
+	if err := plat.Send(context.Background(), &replyContext{messageType: "group", groupID: 101},
+		"[mute:200:5] 刷屏了"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if bans := sentBanParams(f); len(bans) != 0 {
+		t.Fatalf("muted in a group that was not opted in: %v", bans)
+	}
+	for _, text := range sentTexts(f) {
+		if strings.Contains(text, "[mute:") {
+			t.Errorf("marker leaked into sent text: %q", text)
+		}
+	}
+}
+
+func TestModerationRefusesAdminTarget(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"moderation_groups": "100",
+		"admin_ids":         "999",
+	}, nil)
+	plat.noteRecentSender(100, 999)
+
+	if err := plat.Send(context.Background(), &replyContext{messageType: "group", groupID: 100},
+		"[mute:999:10] 别闹了"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if bans := sentBanParams(f); len(bans) != 0 {
+		t.Fatalf("admin was muted: %v", bans)
+	}
+	if texts := sentTexts(f); len(texts) == 0 || !strings.Contains(texts[0], "不能处理管理员") {
+		t.Errorf("expected a refusal note, got %v", texts)
+	}
+}
+
+// TestAdminRequestCanMuteInactiveMember: the owner names someone who has not
+// spoken since the bot restarted; requiring a recent message made the mute fail.
+func TestAdminRequestCanMuteInactiveMember(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"moderation_groups": "100",
+		"admin_ids":         "999",
+	}, nil)
+
+	if err := plat.Send(context.Background(), &replyContext{
+		messageType: "group", groupID: 100, userID: 999, messageID: 1,
+	}, "[mute:200:5] 禁言撸氏五分钟"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if bans := sentBanParams(f); len(bans) != 1 {
+		t.Fatalf("admin request did not mute the named member: %v", bans)
+	}
+}
+
+// TestMarkerOnlyReplySendsNothing: a bare [mute:...] has no text left; sending an
+// empty segment makes QQ show "[该消息类型暂不支持查看]" in the group.
+func TestMarkerOnlyReplySendsNothing(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"moderation_groups": "100",
+		"admin_ids":         "999",
+	}, nil)
+	plat.noteRecentSender(100, 200)
+
+	if err := plat.Send(context.Background(), &replyContext{messageType: "group", groupID: 100},
+		"[mute:200:5]"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if bans := sentBanParams(f); len(bans) != 1 {
+		t.Fatalf("mute did not run: %v", bans)
+	}
+	for _, p := range f.sentParams() {
+		if _, ok := p["message"]; ok {
+			t.Errorf("sent an empty message anyway: %v", p)
+		}
+	}
+}
+
+// TestGroupOwnerBotCanMuteAdmins: once the bot owns the group it outranks
+// everyone, so the admin/owner target checks are skipped.
+func TestGroupOwnerBotCanMuteAdmins(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"moderation_groups": "100",
+		"admin_ids":         "999",
+	}, nil)
+	f.setBotRole("owner")
+	f.setRole(777, "admin")
+
+	if err := plat.Send(context.Background(), &replyContext{
+		messageType: "group", groupID: 100, userID: 999, messageID: 1,
+	}, "[mute:777:3] 群管理也照禁"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if bans := sentBanParams(f); len(bans) != 1 {
+		t.Fatalf("group owner did not mute an admin: %v", bans)
+	}
+}
+
+// TestGroupAdminBotCannotMuteAdmins keeps the old rule while the bot is only an
+// admin: a peer admin outranks it.
+func TestGroupAdminBotCannotMuteAdmins(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"moderation_groups": "100",
+		"admin_ids":         "999",
+	}, nil)
+	f.setRole(777, "admin")
+
+	if err := plat.Send(context.Background(), &replyContext{
+		messageType: "group", groupID: 100, userID: 999, messageID: 1,
+	}, "[mute:777:3] 禁言"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if bans := sentBanParams(f); len(bans) != 0 {
+		t.Fatalf("bot admin muted a peer admin: %v", bans)
+	}
+}
+
+func TestModerationRefusesUnseenTarget(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"moderation_groups": "100",
+		"admin_ids":         "999",
+	}, nil)
+
+	if err := plat.Send(context.Background(), &replyContext{messageType: "group", groupID: 100},
+		"[mute:300:5] 刷屏了"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if bans := sentBanParams(f); len(bans) != 0 {
+		t.Fatalf("muted someone who never spoke: %v", bans)
+	}
+}
+
+func sentRecalls(f *fakeOneBot) []map[string]any {
+	var out []map[string]any
+	for _, p := range f.sentParams() {
+		if _, ok := p["message_id"]; ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func TestAutonomousRecall(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"moderation_groups": "100",
+		"admin_ids":         "999",
+	}, nil)
+	plat.trackMessage(42, 200, "刷屏内容")
+
+	if err := plat.Send(context.Background(), &replyContext{messageType: "group", groupID: 100, messageID: 42},
+		"[recall] 别刷了"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if recalls := sentRecalls(f); len(recalls) != 1 {
+		t.Fatalf("got %d delete_msg calls, want 1", len(recalls))
+	}
+}
+
+func TestRecallRefusesAdminMessage(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"moderation_groups": "100",
+		"admin_ids":         "999",
+	}, nil)
+	plat.trackMessage(43, 999, "管理员说的话")
+
+	if err := plat.Send(context.Background(), &replyContext{messageType: "group", groupID: 100, messageID: 43},
+		"[recall] 撤回"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if recalls := sentRecalls(f); len(recalls) != 0 {
+		t.Fatalf("recalled an admin message: %v", recalls)
+	}
+	for _, text := range sentTexts(f) {
+		if strings.Contains(text, "不能撤回管理员") {
+			return
+		}
+	}
+	t.Error("expected a refusal note about the admin message")
 }
 
 func TestModeOverrideFor(t *testing.T) {
