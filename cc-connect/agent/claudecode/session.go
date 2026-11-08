@@ -45,9 +45,8 @@ type claudeSession struct {
 
 	// gracefulStopTimeout is how long Close() waits for a clean exit
 	// (stdin close → Stop hooks → process exit) before escalating to
-	// SIGTERM and then SIGKILL. Default: 120s to match claude-mem's
-	// Stop hook timeout. The wait ends as soon as the process exits,
-	// so typical shutdowns take seconds, not the full timeout.
+	// SIGTERM and then SIGKILL. Kept short: /new and /switch must not
+	// leave the chat silent, and Close interrupts the running turn first.
 	gracefulStopTimeout time.Duration
 }
 
@@ -201,14 +200,17 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 	}
 
 	cs := &claudeSession{
-		cmd:                 cmd,
-		stdin:               stdin,
-		events:              make(chan core.Event, 64),
-		workDir:             workDir,
-		ctx:                 sessionCtx,
-		cancel:              cancel,
-		done:                make(chan struct{}),
-		gracefulStopTimeout: 120 * time.Second,
+		cmd:     cmd,
+		stdin:   stdin,
+		events:  make(chan core.Event, 64),
+		workDir: workDir,
+		ctx:     sessionCtx,
+		cancel:  cancel,
+		done:    make(chan struct{}),
+		// A user-visible /new or /switch must not leave the chat silent for two
+		// minutes. The interrupt above usually ends the turn immediately; this
+		// bound only covers a stuck CLI.
+		gracefulStopTimeout: 15 * time.Second,
 	}
 	cs.setPermissionMode(mode)
 	cs.sessionID.Store(sessionID)
@@ -702,7 +704,23 @@ func (cs *claudeSession) Alive() bool {
 	return cs.alive.Load()
 }
 
+func (cs *claudeSession) interrupt() {
+	req := map[string]any{
+		"type":       "control_request",
+		"request_id": fmt.Sprintf("interrupt-%d", time.Now().UnixNano()),
+		"request":    map[string]any{"subtype": "interrupt"},
+	}
+	if err := cs.writeJSON(req); err != nil {
+		slog.Debug("claudeSession: interrupt", "error", err)
+	}
+}
+
 func (cs *claudeSession) Close() error {
+	// Abort any turn still in flight. Closing stdin alone does not interrupt it:
+	// the CLI keeps waiting for the API/tool call to finish, which made /new and
+	// /switch go silent for the full graceful timeout.
+	cs.interrupt()
+
 	// Phase 1: Close stdin to signal EOF. Claude Code exits cleanly on
 	// stdin close, running Stop hooks (e.g. claude-mem session summary).
 	cs.stdinMu.Lock()
@@ -729,8 +747,8 @@ func (cs *claudeSession) Close() error {
 	// descendants (e.g. MCP server bridges) a second chance to run cleanup
 	// handlers that respond to signals but not stdin EOF.
 	if err := signalProcessGroup(cs.cmd, syscall.SIGTERM); err != nil {
-			slog.Warn("claudeSession: signal SIGTERM", "error", err)
-		}
+		slog.Warn("claudeSession: signal SIGTERM", "error", err)
+	}
 
 	select {
 	case <-cs.done:

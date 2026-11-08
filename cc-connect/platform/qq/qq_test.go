@@ -2041,6 +2041,23 @@ func TestGroupAdminBotCannotMuteAdmins(t *testing.T) {
 
 // TestModerationMutesMemberWithoutRecentMessage: the target does not have to have
 // spoken recently; membership is the only guard left on the target.
+// TestGroupExtraContentShowsBotRole: the agent must know whether it is the owner
+// or just an admin, because the owner may act on admins and the admin may not.
+func TestGroupExtraContentShowsBotRole(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{"moderation_groups": "100"}, nil)
+
+	f.setBotRole("owner")
+	if got := plat.makeGroupExtraContent("qq:g:100"); !strings.Contains(got, "[群管:群主]") {
+		t.Errorf("owner hint missing: %q", got)
+	}
+
+	// The cache is per group; a fresh platform sees the plain admin tag.
+	plat2, _ := startQQ(t, map[string]any{"moderation_groups": "100"}, nil)
+	if got := plat2.makeGroupExtraContent("qq:g:100"); !strings.Contains(got, "[群管]") || strings.Contains(got, "群主") {
+		t.Errorf("admin hint wrong: %q", got)
+	}
+}
+
 func sentAdminOps(f *fakeOneBot) []map[string]any {
 	var out []map[string]any
 	for _, p := range f.sentParams() {

@@ -179,6 +179,36 @@ closed:
 	}
 }
 
+// TestCloseSendsInterruptBeforeEOF: closing stdin while a turn is in flight does
+// not stop that turn, which left /new and /switch silent for the full timeout.
+func TestCloseSendsInterruptBeforeEOF(t *testing.T) {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	cs := &claudeSession{
+		stdin:               pw,
+		done:                done,
+		gracefulStopTimeout: time.Second,
+	}
+
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- cs.Close() }()
+
+	// The writer side closes once Close has flushed the interrupt and closed the
+	// pipe; only then is it safe to let Close's wait finish.
+	out, _ := io.ReadAll(pr)
+	close(done)
+	if err := <-closeErr; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if !bytes.Contains(out, []byte(`"subtype":"interrupt"`)) {
+		t.Errorf("Close did not send an interrupt before EOF: %s", out)
+	}
+}
+
 func TestClaudeSessionClose_IdempotentNoPanic(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

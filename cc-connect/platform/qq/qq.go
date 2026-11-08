@@ -148,6 +148,16 @@ type Platform struct {
 	// APIs. Opt-in because these actions hit real people.
 	moderationGroups map[int64]bool
 	muteMaxMinutes   int
+
+	// botGroupRoles caches the bot's own role per group so every message can carry
+	// the right [群管] hint without an API call each time.
+	roleMu        sync.Mutex
+	botGroupRoles map[int64]groupRoleEntry
+}
+
+type groupRoleEntry struct {
+	role      string
+	checkedAt time.Time
 }
 
 // peerChain tracks the pacing of one bot-to-bot conversation.
@@ -436,6 +446,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		seenNames:             map[int64]string{},
 		moderationGroups:      moderationGroups,
 		muteMaxMinutes:        muteMaxMinutes,
+		botGroupRoles:         map[int64]groupRoleEntry{},
 		emojiLikeDef:          emojiLikeDef,
 		cronJobs:              cronJobs,
 		recentMessages:        make(map[int64]*recallEntry),
@@ -1469,6 +1480,29 @@ func (p *Platform) moderateRecall(rctx *replyContext) error {
 	return nil
 }
 
+// botGroupRole returns the bot's role in the group, cached for five minutes so
+// the per-message hint does not require an API call every time.
+func (p *Platform) botGroupRole(groupID int64) string {
+	p.roleMu.Lock()
+	if e, ok := p.botGroupRoles[groupID]; ok && time.Since(e.checkedAt) < 5*time.Minute {
+		p.roleMu.Unlock()
+		return e.role
+	}
+	p.roleMu.Unlock()
+
+	if p.selfID == 0 {
+		return ""
+	}
+	role, err := p.groupMemberRole(groupID, p.selfID)
+	if err != nil {
+		return ""
+	}
+	p.roleMu.Lock()
+	p.botGroupRoles[groupID] = groupRoleEntry{role: role, checkedAt: time.Now()}
+	p.roleMu.Unlock()
+	return role
+}
+
 // botIsGroupOwner reports whether the bot itself owns the group. Queried per
 // action — moderation is rate-limited, so the extra call is cheap.
 func (p *Platform) botIsGroupOwner(groupID int64) bool {
@@ -1947,7 +1981,14 @@ func (p *Platform) personaFor(sessionKey string) string {
 func (p *Platform) makeGroupExtraContent(sessionKey string) string {
 	extra := "[群聊消息][" + p.personaFor(sessionKey) + "][" + timeContext() + "]"
 	if gid, ok := groupIDFromSessionKey(sessionKey); ok && p.moderationGroups[gid] {
-		extra += "[群管]"
+		switch p.botGroupRole(gid) {
+		case "owner":
+			extra += "[群管:群主]"
+		case "admin":
+			extra += "[群管:管理员]"
+		default:
+			extra += "[群管]"
+		}
 	}
 	if hint := p.observedBotsHint(); hint != "" {
 		extra += hint
