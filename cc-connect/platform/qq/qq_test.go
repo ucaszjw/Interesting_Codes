@@ -229,7 +229,7 @@ func TestAllowVoice(t *testing.T) {
 	t.Run("no gating when probability is zero", func(t *testing.T) {
 		p := &Platform{voiceProbability: 0}
 		for i := 0; i < 100; i++ {
-			if !p.AllowVoice(group, "", false) {
+			if !p.AllowVoice(group, "你好", false) {
 				t.Fatal("probability 0 should never gate")
 			}
 		}
@@ -238,7 +238,7 @@ func TestAllowVoice(t *testing.T) {
 	t.Run("voice reply is never gated", func(t *testing.T) {
 		p := &Platform{voiceProbability: 1}
 		for i := 0; i < 100; i++ {
-			if !p.AllowVoice(group, "", true) {
+			if !p.AllowVoice(group, "你好", true) {
 				t.Fatal("a reply to a voice message should always be spoken")
 			}
 		}
@@ -247,9 +247,27 @@ func TestAllowVoice(t *testing.T) {
 	t.Run("probability 100 always allows", func(t *testing.T) {
 		p := &Platform{voiceProbability: 100}
 		for i := 0; i < 100; i++ {
-			if !p.AllowVoice(group, "", false) {
+			if !p.AllowVoice(group, "你好", false) {
 				t.Fatal("probability 100 should never gate")
 			}
+		}
+	})
+
+	t.Run("replies carrying adapter markers stay text", func(t *testing.T) {
+		p := &Platform{voiceProbability: 100}
+		for _, text := range []string{
+			"[mute:123:5]",
+			"已禁言 [mute:123:5]",
+			"接着猜 [at:123] /我猜MC是 猪",
+			"[game:end] 结束了",
+			"好 [emoji:76]",
+		} {
+			if p.AllowVoice(group, text, true) {
+				t.Errorf("AllowVoice(%q) = true, a command must run instead of being spoken", text)
+			}
+		}
+		if !p.AllowVoice(group, "普通回复", true) {
+			t.Error("plain text should still be allowed")
 		}
 	})
 
@@ -257,7 +275,7 @@ func TestAllowVoice(t *testing.T) {
 		p := &Platform{voiceProbability: 50}
 		allowed, refused := 0, 0
 		for i := 0; i < 1000; i++ {
-			if p.AllowVoice(group, "", false) {
+			if p.AllowVoice(group, "你好", false) {
 				allowed++
 			} else {
 				refused++
@@ -483,6 +501,8 @@ func newFakeOneBot(t *testing.T) *fakeOneBot {
 				data = map[string]any{"user_id": fakeBotUserID, "nickname": "TestBot"}
 			case "get_group_info":
 				data = map[string]any{"group_name": "测试群"}
+			case "fetch_ptt_text":
+				data = map[string]any{"text": "你好呀"}
 			case "get_group_member_info":
 				role := "member"
 				params, _ := req["params"].(map[string]any)
@@ -1835,6 +1855,95 @@ func TestSanitizeIncomingText_PlainMessageUnchanged(t *testing.T) {
 	}
 }
 
+// TestParseMessage_FetchesQQVoiceTranscript: personal QQ accounts deliver raw
+// audio with no text; the transcript has to be pulled via fetch_ptt_text.
+func TestParseMessage_FetchesQQVoiceTranscript(t *testing.T) {
+	got := make(chan *core.Message, 4)
+	_, f := startQQ(t, map[string]any{
+		"share_session_in_channel": true,
+		"allow_from":               "200",
+		"reply_probability":        0,
+	}, func(_ core.Platform, m *core.Message) { got <- m })
+
+	f.sendEvent(t, map[string]any{
+		"post_type": "message", "message_type": "group", "group_id": int64(100),
+		"user_id": int64(200), "message_id": int64(42),
+		"message": []any{
+			map[string]any{"type": "record", "data": map[string]any{"file": "flag_3s.amr"}},
+		},
+	})
+
+	select {
+	case m := <-got:
+		if !strings.Contains(m.Content, "[语音转文字: 你好呀]") {
+			t.Fatalf("voice content = %q, want the QQ transcript", m.Content)
+		}
+		if !m.FromVoice {
+			t.Error("FromVoice should be true")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("voice message never reached the handler")
+	}
+}
+
+// TestGroupBanNoticeBuffersSystemLine: QQ sends mute/unmute as notices, not as
+// messages, so the agent never saw them unless we translate them into context.
+func TestGroupBanNoticeBuffersSystemLine(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{"share_session_in_channel": true}, nil)
+
+	f.sendEvent(t, map[string]any{
+		"post_type": "notice", "notice_type": "group_ban", "sub_type": "ban",
+		"group_id": int64(100), "user_id": int64(200),
+		"operator_id": int64(999), "duration": int64(600),
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	var lines string
+	for time.Now().Before(deadline) {
+		lines = plat.bufferedText("qq:g:100")
+		if strings.Contains(lines, "[禁言]") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(lines, "[禁言] 999 禁言了 200，时长 10 分钟") {
+		t.Fatalf("mute notice missing from context: %q", lines)
+	}
+
+	f.sendEvent(t, map[string]any{
+		"post_type": "notice", "notice_type": "group_ban", "sub_type": "lift_ban",
+		"group_id": int64(100), "user_id": int64(200),
+		"operator_id": int64(999), "duration": int64(0),
+	})
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		lines = plat.bufferedText("qq:g:100")
+		if strings.Contains(lines, "[解禁]") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(lines, "[解禁] 999 解除了 200 的禁言") {
+		t.Fatalf("unmute notice missing from context: %q", lines)
+	}
+}
+
+func TestFormatBanDuration(t *testing.T) {
+	for _, tc := range []struct {
+		sec  int64
+		want string
+	}{
+		{30, "30 秒"},
+		{60, "1 分钟"},
+		{600, "10 分钟"},
+		{90, "1 分 30 秒"},
+	} {
+		if got := formatBanDuration(tc.sec); got != tc.want {
+			t.Errorf("formatBanDuration(%d) = %q, want %q", tc.sec, got, tc.want)
+		}
+	}
+}
+
 func TestParseModerationMarkers(t *testing.T) {
 	clean, actions := parseModerationMarkers("别刷屏了 [mute:12345:5] 冷静一下 [unmute:678] [recall]")
 	for _, marker := range []string{"[mute:", "[unmute:", "[recall]"} {
@@ -2121,20 +2230,23 @@ func TestOwnerUnsetsGroupAdmin(t *testing.T) {
 	}
 }
 
-func TestAdminChangeRequiresOperator(t *testing.T) {
+// TestOwnerChangesAdminsOnOwnJudgment: the bot may appoint or revoke admins based
+// on the conversation; the requester does not have to be the operator.
+func TestOwnerChangesAdminsOnOwnJudgment(t *testing.T) {
 	plat, f := startQQ(t, map[string]any{
 		"moderation_groups": "100",
 		"admin_ids":         "999",
 	}, nil)
 	f.setBotRole("owner")
+	f.setRole(777, "admin")
 
 	if err := plat.Send(context.Background(), &replyContext{
 		messageType: "group", groupID: 100, userID: 200, messageID: 1,
-	}, "[setadmin:777] 给我管理"); err != nil {
+	}, "[unsetadmin:777] 管理体验卡到头了"); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
-	if ops := sentAdminOps(f); len(ops) != 0 {
-		t.Fatalf("member promoted themselves: %v", ops)
+	if ops := sentAdminOps(f); len(ops) != 1 || ops[0]["enable"] != false {
+		t.Fatalf("owner did not act on its own judgment: %v", ops)
 	}
 }
 

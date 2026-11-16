@@ -202,6 +202,90 @@ func TestOpenAITTS_APIError(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────
+// DeepSeekTTS tests
+// ──────────────────────────────────────────────────────────────
+
+func TestDeepSeekTTS_Success(t *testing.T) {
+	var got map[string]any
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/tools/tts" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if auth := r.Header.Get("Authorization"); auth != "Bearer test-key" {
+			t.Errorf("Authorization = %q", auth)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "audio/wav")
+		_, _ = w.Write([]byte("RIFFfake-wav"))
+	}))
+	defer apiServer.Close()
+
+	tts := NewDeepSeekTTS("test-key", apiServer.URL, nil)
+	audio, format, err := tts.Synthesize(context.Background(), "你好", TTSSynthesisOpts{Voice: "tide"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if format != "wav" || string(audio) != "RIFFfake-wav" {
+		t.Errorf("format=%q audio=%q", format, audio)
+	}
+	if got["text"] != "你好" || got["voice_id"] != "tide" {
+		t.Errorf("request body = %v", got)
+	}
+	if got["format"] != "wav" || got["filter_markdown"] != true {
+		t.Errorf("request body = %v", got)
+	}
+}
+
+func TestDeepSeekTTS_OmitsForeignVoice(t *testing.T) {
+	var got map[string]any
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		_, _ = w.Write([]byte("RIFF"))
+	}))
+	defer apiServer.Close()
+
+	tts := NewDeepSeekTTS("k", apiServer.URL, nil)
+	if _, _, err := tts.Synthesize(context.Background(), "hi", TTSSynthesisOpts{Voice: "zh-CN-XiaoxiaoNeural"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := got["voice_id"]; ok {
+		t.Errorf("a voice for another provider leaked into the request: %v", got)
+	}
+}
+
+func TestDeepSeekTTS_EmptyText(t *testing.T) {
+	tts := NewDeepSeekTTS("k", "", nil)
+	if _, _, err := tts.Synthesize(context.Background(), "   ", TTSSynthesisOpts{}); err == nil {
+		t.Fatal("expected an error for empty text")
+	}
+}
+
+func TestDeepSeekTTS_APIError(t *testing.T) {
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"bad key"}`))
+	}))
+	defer apiServer.Close()
+
+	tts := NewDeepSeekTTS("k", apiServer.URL, nil)
+	if _, _, err := tts.Synthesize(context.Background(), "hi", TTSSynthesisOpts{}); err == nil {
+		t.Fatal("expected an error for non-200 response")
+	}
+}
+
+func TestDeepSeekTTSEndpoint(t *testing.T) {
+	if got := deepSeekTTSEndpoint(""); got != "https://api.deepseek.com/v1/tools/tts" {
+		t.Errorf("default endpoint = %q", got)
+	}
+	if got := deepSeekTTSEndpoint("https://api.deepseek.com"); got != "https://api.deepseek.com/v1/tools/tts" {
+		t.Errorf("root endpoint = %q", got)
+	}
+	if got := deepSeekTTSEndpoint("https://api.deepseek.com/v1/tools/tts/"); got != "https://api.deepseek.com/v1/tools/tts" {
+		t.Errorf("full endpoint = %q", got)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────
 // MiniMaxTTS tests
 // ──────────────────────────────────────────────────────────────
 

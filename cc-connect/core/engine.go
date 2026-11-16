@@ -1964,22 +1964,11 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgVoiceNotEnabled))
 			return
 		}
-		// Use platform recognition with a hint, then continue processing
+		// Use the platform's own recognition silently — a notice about the local
+		// STT provider being unconfigured is just noise on platforms (e.g. QQ) that
+		// already attach a transcript.
 		slog.Info("using platform-provided voice recognition",
 			"platform", msg.Platform, "content_len", len(msg.Content))
-		if msg.FromVoice {
-			// Use platform name as parameter for the message
-			// Capitalize first letter for better presentation
-			if platformName := msg.Platform; len(platformName) > 0 {
-				// Safe capitalization that handles multi-word names
-				r := []rune(platformName)
-				if len(r) > 0 {
-					r[0] = []rune(strings.ToUpper(string(r[0])))[0]
-				}
-				platformName = string(r)
-				e.send(p, msg.ReplyCtx, e.i18n.Tf(MsgVoiceUsingPlatformRecognition, platformName))
-			}
-		}
 		// Continue processing with the platform-provided text content
 	}
 
@@ -4282,8 +4271,34 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			replyStart := time.Now()
 
-			// --- StreamingCard path ---
-			if streamCard != nil && !streamCard.Failed() {
+			state.mu.Lock()
+			fromVoice := state.fromVoice
+			state.mu.Unlock()
+			sendVoice := !isSilent && strings.TrimSpace(fullResponse) != "" &&
+				e.ttsAllowed(p, replyCtx, fullResponse, fromVoice)
+
+			// --- Voice path ---
+			// A voice reply replaces the text copy rather than duplicating it. If
+			// synthesis or delivery fails, fall back to text so the user still gets
+			// an answer.
+			if sendVoice {
+				sp.discard()
+				if hasRichCard && cardMessageID != nil {
+					if cleaner, ok := p.(PreviewCleaner); ok {
+						if err := cleaner.DeletePreviewMessage(e.ctx, cardMessageID); err != nil {
+							slog.Debug("rich card: failed to delete card on voice reply", "platform", p.Name(), "error", err)
+						}
+					}
+					cardMessageID = nil
+				}
+				if !e.sendTTSReply(p, replyCtx, fullResponse) {
+					for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
+						if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
+							return
+						}
+					}
+				}
+			} else if streamCard != nil && !streamCard.Failed() {
 				sp.finish("") // cleanup preview (should be no-op if card was active)
 				// Build final card content with full response
 				finalContent := buildCardContent(cardThinkingText, cardToolCalls, fullResponse)
@@ -4376,14 +4391,6 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			if elapsed := time.Since(replyStart); elapsed >= slowPlatformSend {
 				slog.Warn("slow final reply send", "platform", p.Name(), "elapsed", elapsed, "response_len", len(fullResponse))
-			}
-
-			// TTS: async voice reply if enabled (skipped for silent replies)
-			state.mu.Lock()
-			fromVoice := state.fromVoice
-			state.mu.Unlock()
-			if !isSilent && e.ttsAllowed(p, replyCtx, fullResponse, fromVoice) {
-				go e.sendTTSReply(p, replyCtx, fullResponse)
 			}
 
 			// Auto-compress after finishing a turn, before sending any queued messages.
@@ -12918,20 +12925,20 @@ func (e *Engine) ttsAllowed(p Platform, replyCtx any, text string, fromVoice boo
 }
 
 // sendTTSReply synthesizes fullResponse text and sends audio to the platform.
-// Called asynchronously after EventResult; text reply is always sent first.
-func (e *Engine) sendTTSReply(p Platform, replyCtx any, text string) {
+// It reports whether audio was delivered, so the caller can fall back to text.
+func (e *Engine) sendTTSReply(p Platform, replyCtx any, text string) bool {
 	slog.Debug("tts: sendTTSReply called", "platform", p.Name(), "text_len", len(text))
 	if e.tts == nil {
 		slog.Warn("tts: e.tts is nil, skipping")
-		return
+		return false
 	}
 	if e.tts.TTS == nil {
 		slog.Warn("tts: e.tts.TTS is nil, skipping")
-		return
+		return false
 	}
 	if e.tts.MaxTextLen > 0 && utf8.RuneCountInString(text) > e.tts.MaxTextLen {
 		slog.Warn("tts: text exceeds max_text_len, skipping synthesis", "len", utf8.RuneCountInString(text), "max", e.tts.MaxTextLen)
-		return
+		return false
 	}
 	voice := e.tts.Voice
 	if vs, ok := p.(VoiceSelector); ok {
@@ -12944,19 +12951,20 @@ func (e *Engine) sendTTSReply(p Platform, replyCtx any, text string) {
 	audioData, format, err := e.tts.TTS.Synthesize(e.ctx, StripMarkdown(text), opts)
 	if err != nil {
 		slog.Error("tts: synthesis failed", "error", err)
-		return
+		return false
 	}
 	slog.Info("tts: synthesis successful", "format", format, "audio_size", len(audioData))
 	as, ok := p.(AudioSender)
 	if !ok {
 		slog.Warn("tts: platform does not support audio sending", "platform", p.Name())
-		return
+		return false
 	}
 	if err := as.SendAudio(e.ctx, replyCtx, audioData, format); err != nil {
 		slog.Error("tts: platform audio send failed", "platform", p.Name(), "error", err)
-		return
+		return false
 	}
 	slog.Info("tts: audio sent successfully", "platform", p.Name())
+	return true
 }
 
 // ──────────────────────────────────────────────────────────────

@@ -658,6 +658,15 @@ func main() {
 				} else {
 					slog.Warn("tts: mimo provider enabled but api_key is empty")
 				}
+			case "deepseek":
+				apiKey := cfg.TTS.DeepSeek.APIKey
+				baseURL := cfg.TTS.DeepSeek.BaseURL
+				if apiKey != "" {
+					ttsCfg.TTS = core.NewDeepSeekTTS(apiKey, baseURL, nil)
+					ttsCfg.Provider = "deepseek"
+				} else {
+					slog.Warn("tts: deepseek provider enabled but api_key is empty")
+				}
 			case "espeak":
 				voice := cfg.TTS.Voice
 				if voice == "" {

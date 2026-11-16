@@ -267,6 +267,87 @@ func (o *OpenAITTS) Synthesize(ctx context.Context, text string, opts TTSSynthes
 }
 
 // ──────────────────────────────────────────────────────────────
+// DeepSeekTTS — DeepSeek /v1/tools/tts implementation
+// ──────────────────────────────────────────────────────────────
+
+// DeepSeekTTS implements TextToSpeech using DeepSeek's tools API. Unlike the
+// OpenAI-compatible providers, the response body IS the audio (WAV by default);
+// there is no URL or base64 envelope.
+type DeepSeekTTS struct {
+	APIKey  string
+	BaseURL string
+	Client  *http.Client
+}
+
+// NewDeepSeekTTS creates a new DeepSeekTTS instance.
+func NewDeepSeekTTS(apiKey, baseURL string, client *http.Client) *DeepSeekTTS {
+	if client == nil {
+		client = &http.Client{Timeout: 60 * time.Second}
+	}
+	return &DeepSeekTTS{APIKey: apiKey, BaseURL: baseURL, Client: client}
+}
+
+// deepSeekTTSEndpoint accepts either the API root or the full tool path.
+func deepSeekTTSEndpoint(baseURL string) string {
+	if baseURL == "" {
+		return "https://api.deepseek.com/v1/tools/tts"
+	}
+	u := strings.TrimRight(baseURL, "/")
+	if strings.HasSuffix(u, "/v1/tools/tts") {
+		return u
+	}
+	return u + "/v1/tools/tts"
+}
+
+// Synthesize sends text to DeepSeek TTS and returns WAV audio bytes.
+func (d *DeepSeekTTS) Synthesize(ctx context.Context, text string, opts TTSSynthesisOpts) ([]byte, string, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil, "", fmt.Errorf("deepseek tts: empty text")
+	}
+	reqBody := map[string]any{
+		"text":            text,
+		"format":          "wav",
+		"filter_markdown": true,
+	}
+	// DeepSeek only documents stella/tide; a persona voice meant for another
+	// provider must not be forwarded or the request fails.
+	if opts.Voice == "stella" || opts.Voice == "tide" {
+		reqBody["voice_id"] = opts.Voice
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, "", fmt.Errorf("deepseek tts: marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, deepSeekTTSEndpoint(d.BaseURL), bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, "", fmt.Errorf("deepseek tts: create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+d.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := d.Client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("deepseek tts: request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, "", fmt.Errorf("deepseek tts API %d: %s", resp.StatusCode, body)
+	}
+	audio, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("deepseek tts: read audio: %w", err)
+	}
+	if len(audio) == 0 {
+		return nil, "", fmt.Errorf("deepseek tts: empty audio")
+	}
+	return audio, "wav", nil
+}
+
+// ──────────────────────────────────────────────────────────────
 // MiniMaxTTS — MiniMax T2A v2 TTS implementation
 // ──────────────────────────────────────────────────────────────
 

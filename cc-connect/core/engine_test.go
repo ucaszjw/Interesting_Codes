@@ -13374,6 +13374,60 @@ func TestSendTTSReply_SynthesisFailureIsNotFatal(t *testing.T) {
 	}
 }
 
+// TestVoiceReplyReplacesText: a spoken reply must not also post the same text.
+func TestVoiceReplyReplacesText(t *testing.T) {
+	p := &audioOnlyPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetTTSConfig(&TTSCfg{Enabled: true, Voice: "global-voice", TTS: &recordingTTS{}})
+	e.tts.SetTTSMode("always")
+
+	sessionKey := "test:voice"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-voice")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-voice",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventResult, Content: "这是一条语音回复", Done: true}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
+
+	if sent := p.getSent(); len(sent) != 0 {
+		t.Fatalf("text was sent alongside the voice reply: %#v", sent)
+	}
+	if audio, _ := p.sentAudio(); len(audio) == 0 {
+		t.Fatal("voice reply was not sent")
+	}
+}
+
+// TestVoiceFailureFallsBackToText keeps the answer deliverable when synthesis or
+// audio delivery fails.
+func TestVoiceFailureFallsBackToText(t *testing.T) {
+	p := &audioOnlyPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetTTSConfig(&TTSCfg{Enabled: true, Voice: "global-voice", TTS: &recordingTTS{err: errors.New("boom")}})
+	e.tts.SetTTSMode("always")
+
+	sessionKey := "test:voice-fail"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-voice-fail")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-voice-fail",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventResult, Content: "这条只能发文字", Done: true}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m2", time.Now(), nil, nil, nil)
+
+	if sent := p.getSent(); len(sent) != 1 || sent[0] != "这条只能发文字" {
+		t.Fatalf("text fallback = %#v, want the reply text", sent)
+	}
+}
+
 func TestIsBuiltinCommand(t *testing.T) {
 	for _, tc := range []struct {
 		raw  string

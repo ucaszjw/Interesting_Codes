@@ -306,6 +306,7 @@ type replyState struct {
 
 // msgBuffer accumulates group messages between AI replies for full context.
 type msgBuffer struct {
+	mu    sync.Mutex
 	lines []string  // each: "sender_name(qq): text"
 	start time.Time // when first message was added
 }
@@ -884,9 +885,60 @@ func (p *Platform) handleNotice(payload map[string]any) {
 		p.handlePoke(payload)
 	case noticeType == "group_recall":
 		p.handleGroupRecall(payload)
+	case noticeType == "group_ban":
+		p.handleGroupBan(payload)
 	default:
 		// Ignore other notice types
 	}
+}
+
+// handleGroupBan turns a mute/unmute notice into a line in the group's context
+// buffer. QQ renders these as client-side system messages, which never arrive as
+// regular message events, so without this the agent has no idea someone was
+// muted — including by itself.
+func (p *Platform) handleGroupBan(payload map[string]any) {
+	groupID := jsonInt64(payload, "group_id")
+	if groupID == 0 || !p.isGroupAllowed(groupID) {
+		return
+	}
+	sessionKey := p.groupSessionKey(groupID)
+	if sessionKey == "" {
+		// Per-user sessions have no shared buffer to attach a system line to.
+		return
+	}
+	userID := jsonInt64(payload, "user_id")
+	operatorID := jsonInt64(payload, "operator_id")
+	duration := jsonInt64(payload, "duration")
+
+	var line string
+	if duration > 0 {
+		line = fmt.Sprintf("[禁言] %d 禁言了 %d，时长 %s", operatorID, userID, formatBanDuration(duration))
+	} else {
+		line = fmt.Sprintf("[解禁] %d 解除了 %d 的禁言", operatorID, userID)
+	}
+	p.addSystemBufferLine(sessionKey, line)
+	slog.Info("qq: group ban notice", "group", groupID, "user", userID,
+		"operator", operatorID, "duration_s", duration)
+}
+
+func formatBanDuration(seconds int64) string {
+	switch {
+	case seconds < 60:
+		return fmt.Sprintf("%d 秒", seconds)
+	case seconds%60 == 0:
+		return fmt.Sprintf("%d 分钟", seconds/60)
+	default:
+		return fmt.Sprintf("%d 分 %d 秒", seconds/60, seconds%60)
+	}
+}
+
+// groupSessionKey returns the shared session key for a group, or "" when the
+// project is configured with per-user sessions.
+func (p *Platform) groupSessionKey(groupID int64) string {
+	if !p.shareSessionInChannel {
+		return ""
+	}
+	return fmt.Sprintf("qq:g:%d", groupID)
 }
 
 // handlePoke handles "戳一戳" (poke) events. Only responds when the bot itself is poked.
@@ -1052,9 +1104,11 @@ func (p *Platform) parseMessage(payload map[string]any) (string, []core.ImageAtt
 					keys = append(keys, key)
 				}
 				slog.Info("qq: voice data", "keys", keys, "file", data["file"], "path", data["path"])
+				recognized := false
 				// Check for QQ ASR text (voice-to-text transcription)
 				if t, ok := data["text"].(string); ok && t != "" {
 					textParts = append(textParts, "[语音转文字: "+t+"]")
+					recognized = true
 				} else if file, ok := data["file"].(string); ok {
 					// Extract duration from filename if available, e.g. "flag_49s.amr"
 					duration := ""
@@ -1071,8 +1125,20 @@ func (p *Platform) parseMessage(payload map[string]any) (string, []core.ImageAtt
 				} else {
 					textParts = append(textParts, "[语音消息]")
 				}
-				// Voice-to-text via local Whisper
-				if p.whisperEnabled && p.whisperModel != "" {
+				// Personal QQ accounts carry no transcript in the record event;
+				// fetch_ptt_text asks NapCat for QQ's own recognition instead.
+				if !recognized {
+					if mid := jsonInt64(payload, "message_id"); mid != 0 {
+						if res, err := p.callAPI("fetch_ptt_text", map[string]any{"message_id": mid}); err == nil {
+							if tr, _ := res["text"].(string); strings.TrimSpace(tr) != "" {
+								textParts[len(textParts)-1] = "[语音转文字: " + strings.TrimSpace(tr) + "]"
+								recognized = true
+							}
+						}
+					}
+				}
+				// Voice-to-text via local Whisper (only if QQ had nothing)
+				if !recognized && p.whisperEnabled && p.whisperModel != "" {
 					slog.Info("qq: whisper processing", "has_url", data["url"] != nil)
 					if url, ok := data["url"].(string); ok && url != "" {
 						if transcript := p.transcribeAudio(url); transcript != "" {
@@ -1369,13 +1435,10 @@ func (p *Platform) runModerationAction(rctx *replyContext, a moderationAction) e
 }
 
 // moderateAdmin grants or revokes group-admin rights. Only the group owner can do
-// this, and only at the operator's explicit request: a member must not be able to
-// talk the bot into promoting them.
+// this. The bot may act on its own judgment; the hard limits are that the group
+// owner itself cannot be touched and the configured operator cannot be demoted.
 func (p *Platform) moderateAdmin(rctx *replyContext, a moderationAction) error {
 	groupID := rctx.groupID
-	if !p.isAdmin(rctx.userID) {
-		return fmt.Errorf("只有管理员能调整群管理")
-	}
 	if !p.botIsGroupOwner(groupID) {
 		return fmt.Errorf("只有群主能调整群管理")
 	}
@@ -2182,15 +2245,33 @@ func timeContext() string {
 // ── Message buffer ──────────────────────────────
 
 func (p *Platform) addToBuffer(sessionKey string, userName string, userID int64, text string) {
+	if userName != "" {
+		p.addSystemBufferLine(sessionKey, fmt.Sprintf("%s(%d): %s", userName, userID, text))
+	} else {
+		p.addSystemBufferLine(sessionKey, fmt.Sprintf("(%d): %s", userID, text))
+	}
+}
+
+// addSystemBufferLine appends a pre-formatted line (a message or a system notice
+// such as a mute) to the group's buffer.
+func (p *Platform) addSystemBufferLine(sessionKey, line string) {
 	raw, _ := p.msgBufferMap.LoadOrStore(sessionKey, &msgBuffer{lines: []string{}, start: time.Now()})
 	buf := raw.(*msgBuffer)
+	buf.mu.Lock()
+	buf.lines = append(buf.lines, line)
+	buf.mu.Unlock()
+}
 
-	// Format: "userName(userID): text"
-	if userName != "" {
-		buf.lines = append(buf.lines, fmt.Sprintf("%s(%d): %s", userName, userID, text))
-	} else {
-		buf.lines = append(buf.lines, fmt.Sprintf("(%d): %s", userID, text))
+// bufferedText returns the current buffer contents, for tests and diagnostics.
+func (p *Platform) bufferedText(sessionKey string) string {
+	raw, ok := p.msgBufferMap.Load(sessionKey)
+	if !ok {
+		return ""
 	}
+	buf := raw.(*msgBuffer)
+	buf.mu.Lock()
+	defer buf.mu.Unlock()
+	return strings.Join(buf.lines, "\n")
 }
 
 // flushBuffer returns all buffered messages as a single string and clears the buffer.
@@ -2200,6 +2281,8 @@ func (p *Platform) flushBuffer(sessionKey string) string {
 		return ""
 	}
 	buf := raw.(*msgBuffer)
+	buf.mu.Lock()
+	defer buf.mu.Unlock()
 
 	// Check freshness: if buffer is older than 30 min, discard
 	if time.Since(buf.start) > 30*time.Minute {
@@ -2463,14 +2546,24 @@ func (p *Platform) SelectVoice(replyCtx any) string {
 	return p.personaVoices[rctx.persona]
 }
 
+// voiceNoiseRE matches adapter-only markers. They are instructions (mute, @,
+// game state, emoji reaction) executed on the text send path — never speech.
+var voiceNoiseRE = regexp.MustCompile(`\[(?:mute|unmute|setadmin|unsetadmin):\d+(?::\d+)?\]|\[recall\]|\[game:[^\]]*\]|\[at:\d+\]|\[emoji:\d+\]`)
+
 // AllowVoice thins out voice replies by probability so the group does not get
 // spoken word for every message. A reply that answers a voice message is always
 // spoken; otherwise voiceProbability applies (0 = never gate, i.e. always allow).
 // Private chats are the operator's own workspace and stay text-only.
 // Implements core.VoiceGate.
-func (p *Platform) AllowVoice(replyCtx any, _ string, fromVoice bool) bool {
+func (p *Platform) AllowVoice(replyCtx any, text string, fromVoice bool) bool {
 	rctx, ok := replyCtx.(*replyContext)
 	if !ok || rctx.messageType != "group" {
+		return false
+	}
+	// Markers are executed only on the text send path. A voice reply would read
+	// them aloud and skip the action (mute, @-mention, game move), so any reply
+	// carrying one goes out as text instead.
+	if voiceNoiseRE.MatchString(text) {
 		return false
 	}
 	if fromVoice || p.voiceProbability <= 0 || p.voiceProbability >= 100 {
