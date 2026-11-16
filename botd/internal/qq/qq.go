@@ -1,0 +1,3343 @@
+package qq
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"math/rand"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode"
+
+	"botd/internal/core"
+	"github.com/gorilla/websocket"
+	"github.com/robfig/cron/v3"
+)
+
+func init() {
+	core.RegisterPlatform("qq", New)
+}
+
+// Platform connects to a OneBot v11 implementation (NapCat, LLOneBot, etc.)
+// via forward WebSocket. It receives message events and sends messages back
+// through the same WS connection.
+type Platform struct {
+	wsURL                 string // e.g. "ws://127.0.0.1:3001"
+	token                 string // optional access_token
+	allowFrom             string // comma-separated user IDs or "*"
+	shareSessionInChannel bool
+	requireAt             bool   // only respond to group messages that @ the bot
+	toolAdminOnly         bool   // restrict non-admin users to toolNonAdminMode
+	toolNonAdminMode      string // permission mode for non-admins (default "plan")
+	adminIDs              string // comma-separated admin user IDs
+	groupAllow            string // comma-separated group IDs or "*"
+	handler               core.MessageHandler
+	conn                  *websocket.Conn
+	mu                    sync.Mutex
+	echoSeq               atomic.Int64
+	echoCh                sync.Map // echo -> chan json.RawMessage
+	cancel                context.CancelFunc
+	selfID                int64
+	dedup                 core.MessageDedup
+	groupNameCache        sync.Map // groupID -> group name
+
+	// Group-only feature flags (all default false)
+	replyWithQuote bool   // send replies with quote of original message
+	emojiLike      bool   // add emoji reaction acknowledging received messages
+	emojiLikeDef   string // default emoji_id for reaction; "" = "76" (👍)
+	recallComment  bool   // comment when someone recalls a message in group
+	checkMute      bool   // skip sending if bot is muted in the group
+	whisperEnabled bool   // enable local Whisper ASR for voice messages
+	whisperModel   string // path to whisper model file (.bin)
+
+	// TTS: synthesis and gating live in core (see core/tts.go). The platform only
+	// picks the voice per persona and may thin out voice replies by probability.
+	voiceProbability int               // % chance an eligible reply is spoken; 0 = always (no gating)
+	personaVoices    map[string]string // persona tag -> voice name understood by the configured provider
+
+	// Chat scope: which chat types the bot answers in. Switched at runtime by the
+	// admin-only /scope command and persisted under the data dir.
+	scopeMu   sync.Mutex
+	chatScope string // chatScopeAll | chatScopeGroup | chatScopePrivate
+	scopePath string // "" when the data dir / project name were not injected
+
+	replyProbability int // base reply probability (%, 0 = disabled)
+	replySkipPenalty int // probability decrease per skipped message
+	replyColdBoost   int // probability increase per 10s of silence
+	replyProbMin     int // minimum probability (%)
+	replyProbMax     int // maximum probability (%)
+	// replyCooldown is the minimum number of seconds between replies to messages
+	// that did not address the bot. An @-mention always gets an answer and neither
+	// honours nor resets this, so a direct question is never ignored.
+	replyCooldown int
+
+	// Scheduled tasks (cron): the prompt is sent to the AI for dynamic generation
+	cronJobs      []cronJobConfig
+	cronScheduler *cron.Cron // nil if no cron jobs
+
+	// Mute cache: groupID -> *muteCacheEntry
+	muteCache   sync.Map
+	muteCacheMu sync.Mutex
+
+	// Recent message cache for recall content lookup (messageID -> info)
+	recentMessages   map[int64]*recallEntry
+	recentMessagesMu sync.Mutex
+
+	// Tracks which messages have received emoji reactions (avoids duplicates)
+	emojiReacted sync.Map // messageID string -> bool
+
+	// Persona mapping: sessionKey -> persona tag name
+	personaMap sync.Map
+
+	// Reply probability state per sessionKey
+	replyStateMap sync.Map
+
+	// Message buffer per sessionKey (accumulates group messages between AI replies)
+	msgBufferMap sync.Map
+
+	// Events handed from readLoop to dispatchLoop. Handling happens off the read
+	// loop so API calls issued from a handler (the /scope and /persona replies)
+	// can still have their responses routed, which readLoop is responsible for.
+	msgQueue chan map[string]any
+
+	// QQ CDN rkeys cached per chat kind ("group"/"private"). The rkey inside a
+	// message event's image url can already be stale, so downloads are rebuilt
+	// with a fresh one from get_rkey.
+	rkeyMu  sync.Mutex
+	rkeyMap map[string]rkeyEntry
+
+	// Images that arrived while the session was throttled, kept until the next
+	// message that actually gets answered.
+	pendingMu     sync.Mutex
+	pendingImages map[string]*pendingAttachments
+
+	// Bot peers we may hold a back-and-forth with (e.g. another bot in a guessing
+	// game). They are admitted past the allowlist, but only answered while a game
+	// with them is active — see gameState. That is what bounds bot-to-bot traffic.
+	botPeers   map[int64]bool
+	peerMu     sync.Mutex
+	peerChains sync.Map // groupID -> *peerChain
+
+	// games holds the in-progress bot exchange per group. A model-emitted
+	// [game:start:<uid>] / [game:end] toggles it; it also expires on its own so a
+	// forgotten [game:end] cannot leave the bot permanently mute.
+	gameMu sync.Mutex
+	games  sync.Map // groupID -> *gameState
+
+	// observed records what we passively learn about other bots in the group, so
+	// their usage does not have to be hardcoded in the prompt.
+	observedMu sync.Mutex
+	observed   map[int64]*observedBot
+	seenNames  map[int64]string
+
+	// Autonomous moderation: opt-in per group. The model proposes an action with
+	// markers in its reply; the adapter validates it and calls NapCat's group-admin
+	// APIs. Opt-in because these actions hit real people.
+	moderationGroups map[int64]bool
+	muteMaxMinutes   int
+
+	// botGroupRoles caches the bot's own role per group so every message can carry
+	// the right [群管] hint without an API call each time.
+	roleMu        sync.Mutex
+	botGroupRoles map[int64]groupRoleEntry
+}
+
+type groupRoleEntry struct {
+	role      string
+	checkedAt time.Time
+}
+
+// peerChain tracks the pacing of one bot-to-bot conversation.
+type peerChain struct {
+	lastAt time.Time
+}
+
+// gameState marks an active game with one bot in one group.
+type gameState struct {
+	peer      int64
+	expiresAt time.Time
+}
+
+// observedBot is what a group's traffic revealed about another bot.
+type observedBot struct {
+	command  string // e.g. "/我猜MC是"
+	lastSeen time.Time
+}
+
+const (
+	// peerMinGap is the floor between answers to a peer: a faster reply would mean
+	// the two bots are tight-looping rather than conversing.
+	peerMinGap = 3 * time.Second
+	// gameTTL bounds a game. Every exchange extends it, so an active game keeps
+	// going while an abandoned one stops.
+	gameTTL = 10 * time.Minute
+	// maxObservedBots caps the learned table.
+	maxObservedBots = 50
+)
+
+// pendingAttachments holds images deferred by the throttle for one session.
+type pendingAttachments struct {
+	images    []core.ImageAttachment
+	firstSeen time.Time
+}
+
+const (
+	// maxPendingImages caps how many deferred pictures are carried over, newest wins.
+	maxPendingImages = 4
+	// pendingAttachmentTTL drops a deferred picture that waited too long to be useful.
+	pendingAttachmentTTL = 10 * time.Minute
+)
+
+// rkeyEntry is a cached CDN rkey with the time it was fetched.
+type rkeyEntry struct {
+	value     string
+	fetchedAt time.Time
+}
+
+// rkeyRefreshInterval is how long a cached rkey is reused. QQ hands out rkeys with
+// a ttl of around an hour; refreshing well inside that keeps a margin.
+const rkeyRefreshInterval = 20 * time.Minute
+
+// msgQueueSize bounds how many events may wait behind a slow handler.
+const msgQueueSize = 64
+
+// Chat scope values for the chat_scope option and the /scope command.
+const (
+	chatScopeAll     = "all"     // answer in both private chats and groups
+	chatScopeGroup   = "group"   // answer in groups only
+	chatScopePrivate = "private" // answer in private chats only
+)
+
+// personaCommands is the single source of truth for /persona: each persona tag
+// with the aliases that select it, in the order shown to users. Personas must also
+// be described in the prompt file (CLAUDE.md) for the agent to know how to play
+// them — TestPersonaCommandsCoverPrompt guards that the two stay in step.
+var personaCommands = []struct {
+	persona string
+	aliases []string
+}{
+	{"贴吧老哥", []string{"tieba", "老哥"}},
+	{"猫娘", []string{"neko", "catgirl"}},
+	{"老干部", []string{"cadre", "老干"}},
+	{"母狗", []string{"simp"}},
+	{"萌妹", []string{"cute"}},
+	{"捧哏", []string{"penggen"}},
+	{"直男", []string{"straight"}},
+	{"魅魔", []string{"succubus"}},
+	{"女拳", []string{"feminist"}},
+	{"赛博道士", []string{"taoist", "道士"}},
+	{"弱智吧吧友", []string{"ruozhi", "弱智"}},
+	{"资本家", []string{"capitalist"}},
+	{"营销号", []string{"marketing"}},
+	{"复读机", []string{"repeater"}},
+	{"文豪", []string{"poet"}},
+	{"理中客", []string{"reasonable"}},
+	{"甲方", []string{"client"}},
+	{"中二病", []string{"chuuni", "中二"}},
+	{"男朋友", []string{"bf", "boyfriend"}},
+	{"女朋友", []string{"gf", "girlfriend"}},
+	{"群友", []string{"qunyou", "群u"}},
+	{"大肥鱼", []string{"feiyu", "肥鱼"}},
+}
+
+// validPersonas resolves a /persona argument (or a persona tag itself) to its tag.
+var validPersonas = func() map[string]string {
+	m := make(map[string]string, 2*len(personaCommands))
+	for _, c := range personaCommands {
+		m[c.persona] = c.persona
+		for _, a := range c.aliases {
+			m[a] = c.persona
+		}
+	}
+	return m
+}()
+
+// personaListText renders the available personas for the /persona help reply.
+func personaListText() string {
+	parts := make([]string, 0, len(personaCommands))
+	for _, c := range personaCommands {
+		parts = append(parts, c.persona+"/"+strings.Join(c.aliases, "/"))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// cronJobConfig defines a scheduled group action. A job either asks the agent to
+// compose something (prompt) or sends fixed text verbatim (message).
+type cronJobConfig struct {
+	Cron    string `json:"cron"`
+	Prompt  string `json:"prompt"`
+	Message string `json:"message"` // literal text, sent without the agent
+	At      int64  `json:"at"`      // optional QQ to @-mention before Message
+	GroupID int64  `json:"group_id"`
+}
+
+// recallEntry stores info about a recent message for recall detection.
+type recallEntry struct {
+	userID    int64
+	content   string
+	timestamp time.Time
+}
+
+// muteCacheEntry caches the bot's mute status in a group.
+type muteCacheEntry struct {
+	isMuted  bool
+	until    time.Time // when the mute ends (if isMuted)
+	cachedAt time.Time
+}
+
+// replyState tracks probability-based reply state per session.
+type replyState struct {
+	skipCount     int       // consecutive skipped messages
+	lastReplyTime time.Time // last time we replied
+}
+
+// msgBuffer accumulates group messages between AI replies for full context.
+type msgBuffer struct {
+	mu    sync.Mutex
+	lines []string  // each: "sender_name(qq): text"
+	start time.Time // when first message was added
+}
+
+func New(opts map[string]any) (core.Platform, error) {
+	wsURL, _ := opts["ws_url"].(string)
+	if wsURL == "" {
+		wsURL = "ws://127.0.0.1:3001"
+	}
+	token, _ := opts["token"].(string)
+	allowFrom, _ := opts["allow_from"].(string)
+	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
+	requireAt, _ := opts["require_at"].(bool)
+	toolAdminOnly, _ := opts["tool_admin_only"].(bool)
+	toolNonAdminMode, _ := opts["tool_non_admin_mode"].(string)
+	toolNonAdminMode = strings.TrimSpace(toolNonAdminMode)
+	if toolNonAdminMode == "" {
+		// Plan mode keeps non-admins read-only; the agent's allowed_tools decide
+		// whether anything at all is reachable. "dontAsk" runs only pre-approved
+		// tools (e.g. a web search or the send command) and silently denies the
+		// rest, which is what you want when the bot replies to strangers.
+		toolNonAdminMode = "plan"
+	}
+	adminIDs, _ := opts["admin_ids"].(string)
+	groupAllow, _ := opts["group_allow"].(string)
+
+	// Group-only features
+	replyWithQuote, _ := opts["reply_with_quote"].(bool)
+	emojiLike, _ := opts["emoji_like"].(bool)
+	recallComment, _ := opts["recall_comment"].(bool)
+	checkMute, _ := opts["check_mute"].(bool)
+	whisperEnabled, _ := opts["whisper_enabled"].(bool)
+	whisperModel, _ := opts["whisper_model"].(string)
+	voiceProbability := optInt(opts, "voice_probability")
+	replyProbability := optIntOr(opts, "reply_probability", 30)
+	replySkipPenalty := optIntOr(opts, "reply_skip_penalty", 1)
+	replyColdBoost := optIntOr(opts, "reply_cold_boost", 5)
+	replyProbMin := optIntOr(opts, "reply_prob_min", 10)
+	replyProbMax := optIntOr(opts, "reply_prob_max", 50)
+	replyCooldown := optInt(opts, "reply_cooldown")
+	botPeers := map[int64]bool{}
+	for _, part := range strings.Split(toString(opts["bot_peers"]), ",") {
+		if id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64); err == nil && id != 0 {
+			botPeers[id] = true
+		}
+	}
+
+	// Autonomous moderation is strictly opt-in per group. Empty means off.
+	moderationGroups := map[int64]bool{}
+	for _, part := range strings.Split(toString(opts["moderation_groups"]), ",") {
+		if id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64); err == nil && id != 0 {
+			moderationGroups[id] = true
+		}
+	}
+	muteMaxMinutes := optIntOr(opts, "moderation_mute_max_minutes", 10)
+	if muteMaxMinutes <= 0 {
+		muteMaxMinutes = 10
+	}
+
+	emojiLikeDef, _ := opts["emoji_like_id"].(string)
+
+	personaVoices := map[string]string{}
+	if m, ok := opts["persona_voices"].(map[string]any); ok {
+		for persona, v := range m {
+			if voice, ok := v.(string); ok && voice != "" {
+				personaVoices[persona] = voice
+			}
+		}
+	}
+
+	// Chat scope: the config value is the default, a previously persisted /scope
+	// switch wins because it records the most recent explicit intent.
+	chatScope := parseChatScope(toString(opts["chat_scope"]))
+	if chatScope == "" {
+		chatScope = chatScopeAll
+	}
+	scopePath := chatScopeStatePath(opts)
+	if saved := loadChatScope(scopePath); saved != "" {
+		chatScope = saved
+	}
+
+	if voiceProbability < 0 {
+		voiceProbability = 0
+	}
+	if voiceProbability > 100 {
+		voiceProbability = 100
+	}
+
+	// Cron jobs: prompts sent to the AI for dynamic generation
+	var cronJobs []cronJobConfig
+	if raw, ok := opts["cron_jobs"].([]any); ok {
+		for _, r := range raw {
+			if m, ok := r.(map[string]any); ok {
+				cron := toString(m["cron"])
+				prompt := toString(m["prompt"])
+				message := toString(m["message"])
+				at, _ := toInt64(m["at"])
+				gid, _ := toInt64(m["group_id"])
+				if cron == "" || gid == 0 || (prompt == "" && message == "") {
+					continue
+				}
+				cronJobs = append(cronJobs, cronJobConfig{
+					Cron: cron, Prompt: prompt, Message: message, At: at, GroupID: gid,
+				})
+			}
+		}
+	}
+
+	core.CheckAllowFrom("qq", allowFrom)
+	return &Platform{
+		wsURL:                 wsURL,
+		token:                 token,
+		allowFrom:             allowFrom,
+		shareSessionInChannel: shareSessionInChannel,
+		requireAt:             requireAt,
+		toolAdminOnly:         toolAdminOnly,
+		toolNonAdminMode:      toolNonAdminMode,
+		adminIDs:              adminIDs,
+		groupAllow:            groupAllow,
+		replyWithQuote:        replyWithQuote,
+		emojiLike:             emojiLike,
+		recallComment:         recallComment,
+		checkMute:             checkMute,
+		whisperEnabled:        whisperEnabled,
+		whisperModel:          whisperModel,
+		voiceProbability:      voiceProbability,
+		personaVoices:         personaVoices,
+		chatScope:             chatScope,
+		scopePath:             scopePath,
+		replyProbability:      replyProbability,
+		replySkipPenalty:      replySkipPenalty,
+		replyColdBoost:        replyColdBoost,
+		replyProbMin:          replyProbMin,
+		replyProbMax:          replyProbMax,
+		replyCooldown:         replyCooldown,
+		botPeers:              botPeers,
+		observed:              map[int64]*observedBot{},
+		seenNames:             map[int64]string{},
+		moderationGroups:      moderationGroups,
+		muteMaxMinutes:        muteMaxMinutes,
+		botGroupRoles:         map[int64]groupRoleEntry{},
+		emojiLikeDef:          emojiLikeDef,
+		cronJobs:              cronJobs,
+		recentMessages:        make(map[int64]*recallEntry),
+	}, nil
+}
+
+func (p *Platform) Name() string { return "qq" }
+
+func (p *Platform) Start(handler core.MessageHandler) error {
+	p.handler = handler
+
+	header := http.Header{}
+	if p.token != "" {
+		header.Set("Authorization", "Bearer "+p.token)
+	}
+
+	conn, _, err := websocket.DefaultDialer.Dial(p.wsURL, header)
+	if err != nil {
+		return fmt.Errorf("qq: ws connect failed (%s): %w", p.wsURL, err)
+	}
+	p.conn = conn
+
+	slog.Info("qq: connected to OneBot", "url", p.wsURL)
+
+	if p.replyProbability > 0 {
+		slog.Info("qq: reply throttle",
+			"at_mention", "always",
+			"probability", p.replyProbability,
+			"prob_range", fmt.Sprintf("%d-%d", p.replyProbMin, p.replyProbMax),
+			"cold_boost_per_10s", p.replyColdBoost,
+			"skip_penalty", p.replySkipPenalty,
+			"cooldown_s", p.replyCooldown)
+	} else {
+		slog.Warn("qq: probability gating disabled, every group message reaches the agent")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	p.cancel = cancel
+
+	if p.msgQueue == nil {
+		p.msgQueue = make(chan map[string]any, msgQueueSize)
+	}
+	go p.dispatchLoop(ctx)
+
+	// Start readLoop BEFORE callAPI: callAPI's response is routed by readLoop,
+	// so calling it first would always time out after 15s and leave selfID=0,
+	// which disables the self-message filter in handleMessage and lets the bot
+	// respond to its own messages.
+	go p.readLoop(ctx)
+
+	// Get bot self info
+	if info, err := p.callAPI("get_login_info", nil); err == nil {
+		if uid, ok := info["user_id"].(float64); ok {
+			p.selfID = int64(uid)
+		}
+		nick, _ := info["nickname"].(string)
+		slog.Info("qq: logged in", "qq", p.selfID, "nickname", nick)
+	} else {
+		slog.Warn("qq: get_login_info failed; self-message filter disabled until next reconnect", "error", err)
+	}
+
+	// Start scheduled messages
+	p.startCronJobs()
+
+	return nil
+}
+
+func (p *Platform) readLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		_, raw, err := p.conn.ReadMessage()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Error("qq: ws read error, reconnecting...", "error", err)
+			p.reconnect()
+			continue
+		}
+
+		var payload map[string]any
+		if json.Unmarshal(raw, &payload) != nil {
+			continue
+		}
+
+		// If this is an API response (has "echo" field), route to caller
+		if echo, ok := payload["echo"].(string); ok {
+			if ch, loaded := p.echoCh.LoadAndDelete(echo); loaded {
+				if dataCh, ok := ch.(chan json.RawMessage); ok {
+					dataCh <- raw
+				}
+			}
+			continue
+		}
+
+		// Otherwise it's an event; hand it to the dispatcher so this loop stays
+		// free to route API responses and answer pings.
+		select {
+		case p.msgQueue <- payload:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// dispatchLoop runs message and notice handling on its own goroutine. Handlers
+// issue API calls (incoming-message replies, emoji reactions, mute checks) whose
+// responses can only be routed by readLoop, so handling events inline would
+// deadlock until callAPI's 15s timeout. Running them here keeps readLoop free
+// while still serializing handlers against each other.
+func (p *Platform) dispatchLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-p.msgQueue:
+			switch ev["post_type"] {
+			case "message":
+				p.handleMessage(ev)
+			case "notice":
+				p.handleNotice(ev)
+			}
+		}
+	}
+}
+
+func (p *Platform) reconnect() {
+	for i := 1; i <= 30; i++ {
+		time.Sleep(time.Duration(i) * 2 * time.Second)
+		header := http.Header{}
+		if p.token != "" {
+			header.Set("Authorization", "Bearer "+p.token)
+		}
+		conn, _, err := websocket.DefaultDialer.Dial(p.wsURL, header)
+		if err != nil {
+			slog.Warn("qq: reconnect attempt failed", "attempt", i, "error", err)
+			continue
+		}
+		p.mu.Lock()
+		p.conn = conn
+		p.mu.Unlock()
+		slog.Info("qq: reconnected")
+		return
+	}
+	slog.Error("qq: failed to reconnect after 30 attempts")
+}
+
+func (p *Platform) handleMessage(payload map[string]any) {
+	msgType, _ := payload["message_type"].(string)
+	userID := jsonInt64(payload, "user_id")
+	groupID := jsonInt64(payload, "group_id")
+	messageID := jsonInt64(payload, "message_id")
+
+	if userID == p.selfID {
+		return
+	}
+
+	if ts, ok := payload["time"].(float64); ok && ts > 0 {
+		if core.IsOldMessage(time.Unix(int64(ts), 0)) {
+			slog.Debug("qq: ignoring old message after restart", "time", int64(ts))
+			return
+		}
+	}
+
+	msgIDStr := strconv.FormatInt(messageID, 10)
+	if p.dedup.IsDuplicate(msgIDStr) {
+		slog.Debug("qq: duplicate message ignored", "message_id", messageID)
+		return
+	}
+
+	// Extract sender info early: needed both for the observation below and for the
+	// message context further down.
+	var userName string
+	if sender, ok := payload["sender"].(map[string]any); ok {
+		card, _ := sender["card"].(string)
+		nick, _ := sender["nickname"].(string)
+		if card != "" {
+			userName = card
+		} else {
+			userName = nick
+		}
+	}
+
+	if !p.allowsSender(msgType, groupID, userID) {
+		// Strangers are never answered, but their traffic is how we learn what the
+		// other bots in this group can do — see observe().
+		if msgType == "group" {
+			p.observe(payload, userID, userName)
+		}
+		return
+	}
+
+	// Group allowlist check
+	if groupID != 0 && !p.isGroupAllowed(groupID) {
+		return
+	}
+
+	// Chat scope: drop chats the bot is not answering in. Text is read without
+	// downloading attachments so ignored chats cost nothing.
+	if p.scopeBlocks(msgType, rawTextOf(payload)) {
+		slog.Debug("qq: ignoring message outside chat scope", "scope", p.currentScope(), "type", msgType)
+		return
+	}
+
+	// If require_at is set, only respond to group messages that @ the bot
+	if p.requireAt && msgType == "group" && !p.isBotMentioned(payload) {
+		return
+	}
+
+	// Private chats run in the owner's work_dir, and the CLI auto-approves
+	// in-workspace edits before any permission prompt exists — no permission-mode
+	// switch can make such a session read-only. Non-admin DMs are dropped here,
+	// before the agent or any attachment download.
+	if msgType != "group" && p.toolAdminOnly && !p.isAdmin(userID) {
+		slog.Info("qq: dropped non-admin private message", "user", userID)
+		p.Reply(context.Background(), &replyContext{
+			messageType: msgType,
+			userID:      userID,
+			messageID:   int32(messageID),
+		}, "私聊只对管理员开放，有事群里说。")
+		return
+	}
+
+	// Parse message content from CQ message array or raw_message
+	text, images, audio, fromVoice := p.parseMessage(payload)
+	if text == "" && len(images) == 0 && audio == nil {
+		return
+	}
+	text = sanitizeIncomingText(text)
+
+	var sessionKey string
+	if msgType == "group" {
+		if p.shareSessionInChannel {
+			sessionKey = fmt.Sprintf("qq:g:%d", groupID)
+		} else {
+			sessionKey = fmt.Sprintf("qq:%d:%d", groupID, userID)
+		}
+	} else {
+		sessionKey = fmt.Sprintf("qq:%d", userID)
+	}
+
+	// Control messages are answered unconditionally and are never throttled, so
+	// admin workflows stay responsive. Only recognized commands count: treating
+	// any "/" prefix as a command let "/anything" bypass the throttle.
+	control := isControlCommand(text)
+
+	// Buffer: accumulate group messages for full context between AI replies.
+	// Commands are left out — the engine acts on them directly, so replaying
+	// "/new" or "/persona x" as conversation context is only noise.
+	if msgType == "group" && !control {
+		p.addToBuffer(sessionKey, userName, userID, text)
+	}
+
+	rctx := &replyContext{
+		messageType: msgType,
+		userID:      userID,
+		groupID:     groupID,
+		messageID:   int32(messageID),
+		triggerText: text,
+	}
+
+	// Handle /scope (admin-only) before anything group-specific so switching back
+	// from "only private" is possible from a group and vice versa.
+	if isCommand(text, "/scope") {
+		p.handleScopeCommand(rctx, userID, text)
+		return
+	}
+
+	// Admin commands around bot-peer traffic. Both return before the throttle.
+	if isCommand(text, "/game") {
+		p.handleGameCommand(rctx, userID, text, groupID)
+		return
+	}
+	if isCommand(text, "/bots") {
+		p.handleBotsCommand(rctx, userID)
+		return
+	}
+
+	var chatName string
+	if msgType == "group" {
+		chatName = p.resolveGroupName(groupID)
+		rctx.persona = p.personaFor(sessionKey)
+	}
+
+	// Set ExtraContent to indicate chat type so the agent can differentiate behavior
+	var extraContent string
+	shortReply := false
+
+	if msgType == "group" || (p.toolAdminOnly && !p.isAdmin(userID)) {
+		extraContent = "[群聊消息]"
+		// Add persona tag after [群聊消息] (before sender info)
+		if msgType == "group" {
+			extraContent = p.makeGroupExtraContent(sessionKey)
+			if userName != "" {
+				extraContent = fmt.Sprintf("%s %s(%d):", extraContent, userName, userID)
+			} else {
+				extraContent = fmt.Sprintf("%s (%d):", extraContent, userID)
+			}
+		}
+	}
+
+	// If tool_admin_only is set, non-admin users get the restricted mode.
+	modeOverride := p.modeOverrideFor(msgType, userID)
+
+	// Permission replies are the engine's call: only it knows whether a request is
+	// actually pending. All this adapter does is say who is not allowed to
+	// authorize tool use, and the engine enforces that at the point of decision —
+	// so a plain "好的" in chat is treated as chat, not as a refused approval.
+
+	// Handle /persona command (persona switching)
+	if msgType == "group" && isCommand(text, "/persona") {
+		name := strings.TrimSpace(text[len("/persona"):])
+		if name == "" || validPersonas[name] == "" {
+			p.Reply(context.Background(), rctx, "可用人设: "+personaListText())
+			return
+		}
+		mapped := validPersonas[name]
+		p.personaMap.Store(sessionKey, mapped)
+		// Auto /new to reset session with new persona
+		newMsg := &core.Message{
+			SessionKey:   sessionKey,
+			Platform:     "qq",
+			MessageID:    fmt.Sprintf("persona_%d", time.Now().UnixMilli()),
+			UserID:       strconv.FormatInt(userID, 10),
+			UserName:     userName,
+			Content:      "/new",
+			ExtraContent: extraContent,
+			ReplyCtx:     rctx,
+		}
+		p.handler(p, newMsg)
+		return
+	}
+	// Bot peers are answered only while a game with them is running. That keeps two
+	// bots from chatting indefinitely and keeps every other bot quiet mid-game.
+	peerTurn := false
+	if msgType == "group" && p.botPeers[userID] {
+		if peer, active := p.gamePeer(groupID); active && peer == userID && p.takePeerTurn(groupID) {
+			peerTurn = true
+		} else {
+			slog.Debug("qq: ignoring bot message outside an active game",
+				"group", groupID, "user", userID)
+			return
+		}
+	}
+
+	// Throttling for group messages that did not address the bot. Being
+	// @-mentioned answers 100% of the time and leaves this state untouched, so a
+	// direct question neither spends nor resets the ambient reply budget.
+	if !peerTurn && msgType == "group" && !control && !p.isBotMentioned(payload) && p.replyProbability > 0 {
+		if len(images) > 0 || audio != nil {
+			// Attachments never roll the dice: a dropped picture or recording is
+			// gone for good, since the backlog holds text only. They do observe the
+			// cooldown, and answering one restarts it — otherwise the cooldown would
+			// barely bite here, because its clock is otherwise only advanced by dice
+			// replies, which are the rare case.
+			rs := p.replyStateFor(sessionKey)
+			now := time.Now()
+			if p.inCooldown(rs, now) {
+				rs.skipCount++
+				// Defer rather than drop: the backlog can only carry the "[图片]"
+				// marker, so discarding the bytes would leave the agent reading about
+				// a picture it cannot see.
+				p.stashImages(sessionKey, images)
+				slog.Info("qq: skip, cooldown", "session", sessionKey, "kind", "attachment", "deferred", len(images))
+				return
+			}
+			rs.lastReplyTime = now
+		} else if !p.shouldReply(sessionKey, text) {
+			// shouldReply already logged whether it was the cooldown or the dice.
+			slog.Info("qq: skip, throttle", "session", sessionKey, "text", truncateText(text, 20))
+			return
+		} else {
+			shortReply = true
+		}
+	}
+
+	// When replying, flush buffered messages as context. Commands keep their own
+	// text: the engine dispatches them by looking for a leading "/", so replacing
+	// it with the backlog would silently turn e.g. /new into ordinary chat.
+	if msgType == "group" && !control {
+		if buffered := p.flushBuffer(sessionKey); buffered != "" {
+			text = buffered
+		}
+	}
+
+	// 概率触发时简短回复
+	if shortReply {
+		extraContent += " 简短回复，像日常聊天一样说一两句即可，不要长篇大论"
+	}
+	// Any picture the throttle held back rides along with this reply, so the
+	// "[图片]" line in the backlog finally has its attachment.
+	if deferred := p.takeImages(sessionKey); len(deferred) > 0 {
+		images = append(deferred, images...)
+	}
+
+	msg := &core.Message{
+		SessionKey:   sessionKey,
+		Platform:     "qq",
+		MessageID:    strconv.FormatInt(messageID, 10),
+		UserID:       strconv.FormatInt(userID, 10),
+		UserName:     userName,
+		ChatName:     chatName,
+		Content:      text,
+		ExtraContent: extraContent,
+		Images:       images,
+		Audio:        audio,
+		FromVoice:    fromVoice,
+		ModeOverride: modeOverride,
+		// With tool_admin_only, non-admins may chat but must not authorize tool
+		// use. The engine only acts on this while a permission is pending.
+		BlockPermissionApproval: p.toolAdminOnly && !p.isAdmin(userID),
+		ReplyCtx:                rctx,
+	}
+
+	// Track recent messages for recall content lookup (group only)
+	if p.recallComment && msgType == "group" && messageID != 0 {
+		p.trackMessage(messageID, userID, text)
+	}
+
+	slog.Debug("qq: message received", "type", msgType, "user", userID, "text_len", len(text))
+	p.handler(p, msg)
+}
+
+// handleNotice dispatches OneBot notice events.
+func (p *Platform) handleNotice(payload map[string]any) {
+	noticeType, _ := payload["notice_type"].(string)
+	subType, _ := payload["sub_type"].(string)
+
+	switch {
+	case noticeType == "notify" && subType == "poke":
+		p.handlePoke(payload)
+	case noticeType == "group_recall":
+		p.handleGroupRecall(payload)
+	case noticeType == "group_ban":
+		p.handleGroupBan(payload)
+	default:
+		// Ignore other notice types
+	}
+}
+
+// handleGroupBan turns a mute/unmute notice into a line in the group's context
+// buffer. QQ renders these as client-side system messages, which never arrive as
+// regular message events, so without this the agent has no idea someone was
+// muted — including by itself.
+func (p *Platform) handleGroupBan(payload map[string]any) {
+	groupID := jsonInt64(payload, "group_id")
+	if groupID == 0 || !p.isGroupAllowed(groupID) {
+		return
+	}
+	sessionKey := p.groupSessionKey(groupID)
+	if sessionKey == "" {
+		// Per-user sessions have no shared buffer to attach a system line to.
+		return
+	}
+	userID := jsonInt64(payload, "user_id")
+	operatorID := jsonInt64(payload, "operator_id")
+	duration := jsonInt64(payload, "duration")
+
+	var line string
+	if duration > 0 {
+		line = fmt.Sprintf("[禁言] %d 禁言了 %d，时长 %s", operatorID, userID, formatBanDuration(duration))
+	} else {
+		line = fmt.Sprintf("[解禁] %d 解除了 %d 的禁言", operatorID, userID)
+	}
+	p.addSystemBufferLine(sessionKey, line)
+	slog.Info("qq: group ban notice", "group", groupID, "user", userID,
+		"operator", operatorID, "duration_s", duration)
+}
+
+func formatBanDuration(seconds int64) string {
+	switch {
+	case seconds < 60:
+		return fmt.Sprintf("%d 秒", seconds)
+	case seconds%60 == 0:
+		return fmt.Sprintf("%d 分钟", seconds/60)
+	default:
+		return fmt.Sprintf("%d 分 %d 秒", seconds/60, seconds%60)
+	}
+}
+
+// groupSessionKey returns the shared session key for a group, or "" when the
+// project is configured with per-user sessions.
+func (p *Platform) groupSessionKey(groupID int64) string {
+	if !p.shareSessionInChannel {
+		return ""
+	}
+	return fmt.Sprintf("qq:g:%d", groupID)
+}
+
+// handlePoke handles "戳一戳" (poke) events. Only responds when the bot itself is poked.
+func (p *Platform) handlePoke(payload map[string]any) {
+	userID := jsonInt64(payload, "user_id")
+	targetID := jsonInt64(payload, "target_id")
+	groupID := jsonInt64(payload, "group_id")
+
+	// Only respond when the bot is poked
+	if targetID != p.selfID {
+		return
+	}
+
+	if userID == p.selfID {
+		return
+	}
+
+	msgType := "private"
+	if groupID != 0 {
+		msgType = "group"
+	}
+
+	if !p.allowsSender(msgType, groupID, userID) {
+		return
+	}
+
+	// Group allowlist check
+	if groupID != 0 && !p.isGroupAllowed(groupID) {
+		return
+	}
+
+	if ts, ok := payload["time"].(float64); ok && ts > 0 {
+		if core.IsOldMessage(time.Unix(int64(ts), 0)) {
+			slog.Debug("qq: ignoring old poke event", "time", int64(ts))
+			return
+		}
+	}
+
+	if !p.scopeAllows(msgType) {
+		return
+	}
+
+	// Same rule as a private text message: non-admin DMs never reach the agent.
+	if msgType != "group" && p.toolAdminOnly && !p.isAdmin(userID) {
+		slog.Info("qq: dropped non-admin private poke", "user", userID)
+		return
+	}
+
+	var sessionKey string
+	if msgType == "group" {
+		if p.shareSessionInChannel {
+			sessionKey = fmt.Sprintf("qq:g:%d", groupID)
+		} else {
+			sessionKey = fmt.Sprintf("qq:%d:%d", groupID, userID)
+		}
+	} else {
+		sessionKey = fmt.Sprintf("qq:%d", userID)
+	}
+
+	rctx := &replyContext{
+		messageType: msgType,
+		userID:      userID,
+		groupID:     groupID,
+	}
+
+	var chatName string
+	if msgType == "group" {
+		chatName = p.resolveGroupName(groupID)
+		rctx.persona = p.personaFor(sessionKey)
+	}
+
+	var extraContent string
+	if msgType == "group" {
+		extraContent = fmt.Sprintf("%s (%d):", p.makeGroupExtraContent(sessionKey), userID)
+	} else if p.toolAdminOnly && !p.isAdmin(userID) {
+		extraContent = "[群聊消息]"
+	}
+
+	modeOverride := p.modeOverrideFor(msgType, userID)
+
+	msg := &core.Message{
+		SessionKey:   sessionKey,
+		Platform:     "qq",
+		MessageID:    fmt.Sprintf("poke_%d_%d", userID, time.Now().UnixMilli()),
+		UserID:       strconv.FormatInt(userID, 10),
+		UserName:     strconv.FormatInt(userID, 10),
+		ChatName:     chatName,
+		Content:      "poke",
+		ExtraContent: extraContent,
+		ModeOverride: modeOverride,
+		ReplyCtx:     rctx,
+	}
+
+	slog.Debug("qq: poke received", "type", msgType, "user", userID)
+	p.handler(p, msg)
+}
+
+// stickerMeta classifies an image segment. NapCat reports normal photos as
+// sub_type=0; animated stickers are sub_type=1 with "[动画表情]", and market
+// faces are sub_type=7 with a label like "[/呲牙]".
+func stickerMeta(data map[string]any) (sticker bool, label string) {
+	label, _ = data["summary"].(string)
+	switch v := data["sub_type"].(type) {
+	case float64:
+		sticker = v != 0
+	case int:
+		sticker = v != 0
+	case int64:
+		sticker = v != 0
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			sticker = n != 0
+		}
+	}
+	if strings.Contains(label, "动画表情") || strings.HasPrefix(label, "/") {
+		sticker = true
+	}
+	return sticker, label
+}
+
+func (p *Platform) parseMessage(payload map[string]any) (string, []core.ImageAttachment, *core.AudioAttachment, bool) {
+	var textParts []string
+	var mdTexts []string
+	var images []core.ImageAttachment
+	var audio *core.AudioAttachment
+	fromVoice := false
+
+	// OneBot message can be array of segments or a string
+	switch msg := payload["message"].(type) {
+	case []any:
+		for _, seg := range msg {
+			s, ok := seg.(map[string]any)
+			if !ok {
+				continue
+			}
+			segType, _ := s["type"].(string)
+			data, _ := s["data"].(map[string]any)
+			if data == nil {
+				continue
+			}
+
+			switch segType {
+			case "text":
+				if text, ok := data["text"].(string); ok && !echoesMarkdown(mdTexts, text) {
+					textParts = append(textParts, text)
+				}
+			case "markdown":
+				// Bot replies on QQ often arrive as a markdown element whose body
+				// (and any inline links) is lost if we ignore the segment. These
+				// replies also embed generated images as ![图片](url) inline, so
+				// pull those out and download them like a normal image segment.
+				if content, ok := data["content"].(string); ok {
+					text, urls := markdownParts(content)
+					if text != "" {
+						mdTexts = append(mdTexts, text)
+						textParts = append(textParts, text)
+					}
+					for _, u := range urls {
+						textParts = append(textParts, "[图片]")
+						img, ok := p.fetchImage(map[string]any{"url": u}, chatKind(payload))
+						if !ok {
+							textParts[len(textParts)-1] = "[图片(加载失败)]"
+							continue
+						}
+						images = append(images, img)
+					}
+				}
+			case "image":
+				// Mark the position so the prompt says an image was attached, the
+				// same way voice messages contribute "[语音 3s]". Without it an
+				// image-only message has no text at all and the agent is left
+				// guessing why it received an attachment.
+				textParts = append(textParts, "[图片]")
+				img, ok := p.fetchImage(data, chatKind(payload))
+				if !ok {
+					// Say so explicitly rather than leaving a bare "[图片]" next to a
+					// missing attachment, which invites the agent to invent an excuse.
+					textParts[len(textParts)-1] = "[图片(加载失败)]"
+					continue
+				}
+				img.Sticker, img.Label = stickerMeta(data)
+				images = append(images, img)
+			case "mface":
+				// Market faces / stored stickers. NapCat uses image sub_type=7 for
+				// these in history, but live events may still come as mface.
+				label, _ := data["summary"].(string)
+				if label == "" {
+					label = "[表情]"
+				}
+				textParts = append(textParts, label)
+				if u, _ := data["url"].(string); u != "" {
+					if img, ok := p.fetchImage(map[string]any{"url": u}, chatKind(payload)); ok {
+						img.Sticker = true
+						img.Label = label
+						images = append(images, img)
+					}
+				}
+			case "record":
+				fromVoice = true
+				var keys []string
+				for key := range data {
+					keys = append(keys, key)
+				}
+				slog.Info("qq: voice data", "keys", keys, "file", data["file"], "path", data["path"])
+				recognized := false
+				// Check for QQ ASR text (voice-to-text transcription)
+				if t, ok := data["text"].(string); ok && t != "" {
+					textParts = append(textParts, "[语音转文字: "+t+"]")
+					recognized = true
+				} else if file, ok := data["file"].(string); ok {
+					// Extract duration from filename if available, e.g. "flag_49s.amr"
+					duration := ""
+					if idx := strings.LastIndex(file, "_"); idx >= 0 {
+						if end := strings.Index(file[idx:], "s"); end > 1 {
+							duration = file[idx+1 : idx+end]
+						}
+					}
+					if duration != "" {
+						textParts = append(textParts, "[语音 "+duration+"s]")
+					} else {
+						textParts = append(textParts, "[语音消息]")
+					}
+				} else {
+					textParts = append(textParts, "[语音消息]")
+				}
+				// Personal QQ accounts carry no transcript in the record event;
+				// fetch_ptt_text asks NapCat for QQ's own recognition instead.
+				if !recognized {
+					if mid := jsonInt64(payload, "message_id"); mid != 0 {
+						if res, err := p.callAPI("fetch_ptt_text", map[string]any{"message_id": mid}); err == nil {
+							if tr, _ := res["text"].(string); strings.TrimSpace(tr) != "" {
+								textParts[len(textParts)-1] = "[语音转文字: " + strings.TrimSpace(tr) + "]"
+								recognized = true
+							}
+						}
+					}
+				}
+				// Voice-to-text via local Whisper (only if QQ had nothing)
+				if !recognized && p.whisperEnabled && p.whisperModel != "" {
+					slog.Info("qq: whisper processing", "has_url", data["url"] != nil)
+					if url, ok := data["url"].(string); ok && url != "" {
+						if transcript := p.transcribeAudio(url); transcript != "" {
+							textParts[len(textParts)-1] = "[语音: " + transcript + "]"
+						}
+					}
+				}
+				// Also download audio for agents that support it
+				if url, ok := data["url"].(string); ok && url != "" {
+					audioData, _, err := downloadFile(url)
+					if err != nil {
+						slog.Warn("qq: download audio failed", "error", err)
+						continue
+					}
+					format := "silk"
+					if f, ok := data["file"].(string); ok {
+						if strings.HasSuffix(f, ".amr") {
+							format = "amr"
+						} else if strings.HasSuffix(f, ".mp3") {
+							format = "mp3"
+						}
+					}
+					audio = &core.AudioAttachment{
+						Data:   audioData,
+						Format: format,
+					}
+				}
+			case "at":
+				if qq, ok := data["qq"].(string); ok && qq != "" {
+					if qq == "all" {
+						textParts = append(textParts, "@所有人")
+					} else if p.selfID != 0 && qq == strconv.FormatInt(p.selfID, 10) {
+						// Skip @bot itself so commands like /new still work
+					} else {
+						textParts = append(textParts, "@"+qq)
+					}
+				}
+			}
+		}
+	default:
+		// raw_message fallback (string with CQ codes)
+		if raw, ok := payload["raw_message"].(string); ok {
+			textParts = append(textParts, stripCQCodes(raw))
+		}
+	}
+
+	return strings.TrimSpace(strings.Join(textParts, "")), images, audio, fromVoice
+}
+
+// senderHeaderRE matches a user-typed imitation of our "nickname(QQ):" header.
+var senderHeaderRE = regexp.MustCompile(`([^\s()（）\[\]]{1,32})\s*[(（]\s*(\d{5,12})\s*[)）]\s*[:：]`)
+
+// incomingEscapes neutralises markers that are only meaningful when the adapter
+// writes them. A member typing them must not look like a system directive.
+var incomingEscapes = strings.NewReplacer(
+	"[群管]", "［群管］",
+	"[群聊消息]", "［群聊消息］",
+	"[mute:", "［mute：",
+	"[unmute:", "［unmute：",
+	"[setadmin:", "［setadmin：",
+	"[unsetadmin:", "［unsetadmin：",
+	"[recall]", "［recall］",
+	"[game:start:", "［game:start：",
+	"[game:end]", "［game:end］",
+	"[at:", "［at：",
+	"[emoji:", "［emoji：",
+)
+
+// sanitizeIncomingText keeps a member from forging context inside their own
+// message. A line shaped like our "nickname(QQ):" header would let them speak as
+// someone else, so such headers are rewritten to full-width punctuation and every
+// continuation line gets a "↳ " prefix — only the real, adapter-generated header
+// can start a line. Marker text like [群管] is escaped for the same reason.
+func sanitizeIncomingText(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = senderHeaderRE.ReplaceAllString(text, "$1（$2）﹕")
+	text = incomingEscapes.Replace(text)
+	lines := strings.Split(text, "\n")
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) != "" {
+			lines[i] = "↳ " + lines[i]
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// Reply sends a message as a reply to an incoming message.
+func (p *Platform) Reply(ctx context.Context, replyCtx any, content string) error {
+	return p.Send(ctx, replyCtx, content)
+}
+
+// Send sends a message to the conversation identified by replyCtx.
+func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error {
+	rctx, ok := replyCtx.(*replyContext)
+	if !ok {
+		return fmt.Errorf("qq: invalid reply context")
+	}
+
+	// Mute check: skip sending if bot is muted in the group
+	if p.checkMute && rctx.messageType == "group" && rctx.groupID != 0 {
+		if p.isMutedInGroup(rctx.groupID) {
+			slog.Debug("qq: skip send, bot is muted in group", "group_id", rctx.groupID)
+			return nil
+		}
+	}
+
+	var emojiID string
+	cleanContent := content
+
+	// Strip [emo*:...] markers (AI may output various formats)
+	if idx := strings.LastIndex(content, "[emo"); idx >= 0 {
+		if end := strings.Index(content[idx:], "]"); end > 4 {
+			cleanContent = strings.TrimSpace(content[:idx] + content[idx+end+1:])
+			raw := content[idx+4 : idx+end]
+			if _, after, found := strings.Cut(raw, ":"); found {
+				emojiID = strings.TrimSpace(after)
+			}
+			slog.Debug("qq: stripped emoji marker", "raw", raw, "clean", truncateText(cleanContent, 60))
+		}
+	}
+
+	// Moderation markers ([mute:uid:min], [unmute:uid], [recall]) are stripped
+	// everywhere; they only execute in opted-in groups. Failures are appended so
+	// the group is not told an action happened when it did not.
+	cleanContent, modActions := parseModerationMarkers(cleanContent)
+	if notes := p.applyModeration(rctx, modActions); len(notes) > 0 {
+		cleanContent = strings.TrimSpace(cleanContent + "\n（" + strings.Join(notes, "；") + "）")
+	}
+
+	// [game:start:<uid>] / [game:end] toggle bot-peer traffic for this group. They
+	// are stripped from the outgoing text like the other markers.
+	if m := gameStartMarker.FindStringSubmatch(cleanContent); m != nil {
+		if uid, err := strconv.ParseInt(m[1], 10, 64); err == nil {
+			p.setGame(rctx.groupID, uid)
+			cleanContent = strings.TrimSpace(gameStartMarker.ReplaceAllString(cleanContent, ""))
+			slog.Info("qq: game started", "group", rctx.groupID, "peer", uid)
+		}
+	}
+	if gameEndMarker.MatchString(cleanContent) {
+		p.clearGame(rctx.groupID)
+		cleanContent = strings.TrimSpace(gameEndMarker.ReplaceAllString(cleanContent, ""))
+		slog.Info("qq: game ended", "group", rctx.groupID)
+	}
+	// Addressing a bot peer is itself enough to arm the exchange: the model often
+	// forgets the [game:start:<uid>] marker, and without it the peer's reply is
+	// silently dropped — the game then never advances on its own.
+	if rctx.messageType == "group" {
+		if uid, ok := p.botPeerMention(cleanContent); ok {
+			p.setGame(rctx.groupID, uid)
+			slog.Info("qq: game armed by mention", "group", rctx.groupID, "peer", uid)
+		}
+	}
+
+	// A reply consisting only of markers (e.g. a bare [mute:...]) has nothing left
+	// to say. Sending it anyway puts an empty text segment on the wire, which QQ
+	// renders as "[该消息类型暂不支持查看]". The action already ran above.
+	if strings.TrimSpace(cleanContent) == "" {
+		if rctx.messageType == "group" && p.emojiLike && emojiID != "" && rctx.messageID != 0 {
+			p.addEmojiLike(int64(rctx.messageID), emojiID)
+		}
+		return nil
+	}
+
+	// [at:QQ] markers become real mentions. A literal "@名字" in the text is not a
+	// mention to QQ, and other bots only react to an at-segment.
+	messageValue := any(cleanContent)
+	if segs, ok := atSegments(cleanContent); ok {
+		messageValue = segs
+	}
+
+	params := map[string]any{}
+
+	if rctx.messageType == "group" {
+		params["group_id"] = rctx.groupID
+
+		// Send as reply with quote
+		if p.replyWithQuote && rctx.messageID != 0 {
+			segments := []map[string]any{
+				{"type": "reply", "data": map[string]any{"id": strconv.FormatInt(int64(rctx.messageID), 10)}},
+			}
+			switch v := messageValue.(type) {
+			case string:
+				segments = append(segments, map[string]any{"type": "text", "data": map[string]any{"text": v}})
+			case []map[string]any:
+				segments = append(segments, v...)
+			}
+			params["message"] = segments
+		} else {
+			params["message"] = messageValue
+		}
+		_, err := p.callAPI("send_group_msg", params)
+		if err == nil && p.emojiLike && emojiID != "" && rctx.messageID != 0 {
+			p.addEmojiLike(int64(rctx.messageID), emojiID)
+		}
+		return err
+	}
+
+	params["user_id"] = rctx.userID
+	params["message"] = messageValue
+	_, err := p.callAPI("send_private_msg", params)
+	return err
+}
+
+// atMarker matches the inline [at:QQ] marker the agent writes to mention someone.
+var atMarker = regexp.MustCompile(`\[at:(\d+)\]`)
+
+// Game markers toggle bot-peer traffic; see gameState.
+var (
+	gameStartMarker = regexp.MustCompile(`\[game:start:(\d+)\]`)
+	gameEndMarker   = regexp.MustCompile(`\[game:end\]`)
+)
+
+// Moderation markers the agent may write when it decides, on its own, that a
+// group needs action. Only honoured in groups listed in moderation_groups.
+var (
+	moderationMuteMarker       = regexp.MustCompile(`\[mute:(\d+)(?::(\d+))?\]`)
+	moderationUnmuteMarker     = regexp.MustCompile(`\[unmute:(\d+)\]`)
+	moderationSetAdminMarker   = regexp.MustCompile(`\[setadmin:(\d+)\]`)
+	moderationUnsetAdminMarker = regexp.MustCompile(`\[unsetadmin:(\d+)\]`)
+	moderationRecallMarker     = regexp.MustCompile(`\[recall\]`)
+)
+
+type moderationAction struct {
+	kind    string // "mute" | "unmute" | "setadmin" | "unsetadmin" | "recall"
+	target  int64
+	minutes int
+}
+
+// parseModerationMarkers removes moderation markers from the outgoing text and
+// returns the actions they requested. Markers are stripped everywhere so they can
+// never leak into a chat; only moderation groups execute them (see applyModeration).
+func parseModerationMarkers(content string) (string, []moderationAction) {
+	var actions []moderationAction
+	content = moderationMuteMarker.ReplaceAllStringFunc(content, func(m string) string {
+		sub := moderationMuteMarker.FindStringSubmatch(m)
+		uid, _ := strconv.ParseInt(sub[1], 10, 64)
+		minutes := 0
+		if len(sub) > 2 && sub[2] != "" {
+			minutes, _ = strconv.Atoi(sub[2])
+		}
+		actions = append(actions, moderationAction{kind: "mute", target: uid, minutes: minutes})
+		return ""
+	})
+	content = moderationUnmuteMarker.ReplaceAllStringFunc(content, func(m string) string {
+		sub := moderationUnmuteMarker.FindStringSubmatch(m)
+		uid, _ := strconv.ParseInt(sub[1], 10, 64)
+		actions = append(actions, moderationAction{kind: "unmute", target: uid})
+		return ""
+	})
+	content = moderationSetAdminMarker.ReplaceAllStringFunc(content, func(m string) string {
+		sub := moderationSetAdminMarker.FindStringSubmatch(m)
+		uid, _ := strconv.ParseInt(sub[1], 10, 64)
+		actions = append(actions, moderationAction{kind: "setadmin", target: uid})
+		return ""
+	})
+	content = moderationUnsetAdminMarker.ReplaceAllStringFunc(content, func(m string) string {
+		sub := moderationUnsetAdminMarker.FindStringSubmatch(m)
+		uid, _ := strconv.ParseInt(sub[1], 10, 64)
+		actions = append(actions, moderationAction{kind: "unsetadmin", target: uid})
+		return ""
+	})
+	content = moderationRecallMarker.ReplaceAllStringFunc(content, func(string) string {
+		actions = append(actions, moderationAction{kind: "recall"})
+		return ""
+	})
+	return strings.TrimSpace(content), actions
+}
+
+// applyModeration executes model-requested actions and returns short failure notes
+// for the reply. It is a no-op outside opted-in groups.
+// moderationRequestRE spots a member asking for a moderation power. The bot may
+// still act on its own observation, but not on a non-operator's command.
+var moderationRequestRE = regexp.MustCompile(`(禁言|解禁|撤回|撤销管理|取消管理|设置管理|设为管理|撤管理|踢出|踢了)`)
+
+func (p *Platform) applyModeration(rctx *replyContext, actions []moderationAction) []string {
+	if len(actions) == 0 || rctx.messageType != "group" || !p.moderationGroups[rctx.groupID] {
+		return nil
+	}
+	// Only the operator and the bot's own judgment may trigger moderation. A
+	// non-admin's explicit request must not turn into a mute/unmute/recall.
+	if !p.isAdmin(rctx.userID) && moderationRequestRE.MatchString(rctx.triggerText) {
+		return []string{"权限指令只认张氏"}
+	}
+	var notes []string
+	for _, a := range actions {
+		if err := p.runModerationAction(rctx, a); err != nil {
+			notes = append(notes, err.Error())
+		}
+	}
+	return notes
+}
+
+func (p *Platform) runModerationAction(rctx *replyContext, a moderationAction) error {
+	switch a.kind {
+	case "mute", "unmute":
+		return p.moderateMute(rctx, a)
+	case "setadmin", "unsetadmin":
+		return p.moderateAdmin(rctx, a)
+	case "recall":
+		return p.moderateRecall(rctx)
+	}
+	return nil
+}
+
+// moderateAdmin grants or revokes group-admin rights. Only the group owner can do
+// this. The bot may act on its own judgment; the hard limits are that the group
+// owner itself cannot be touched and the configured operator cannot be demoted.
+func (p *Platform) moderateAdmin(rctx *replyContext, a moderationAction) error {
+	groupID := rctx.groupID
+	if !p.botIsGroupOwner(groupID) {
+		return fmt.Errorf("只有群主能调整群管理")
+	}
+	// Appointing an admin requires the operator's explicit request; revoking one
+	// may be the bot's own judgment after observing abuse.
+	if a.kind == "setadmin" && !p.isAdmin(rctx.userID) {
+		return fmt.Errorf("只有张氏能设立群管理")
+	}
+	if a.target == 0 || a.target == p.selfID {
+		return fmt.Errorf("目标无效")
+	}
+	role, err := p.groupMemberRole(groupID, a.target)
+	if err != nil {
+		return fmt.Errorf("查不到这个群成员")
+	}
+	if role == "owner" {
+		return fmt.Errorf("不能调整群主")
+	}
+	if a.kind == "unsetadmin" && p.isAdmin(a.target) {
+		return fmt.Errorf("不能取消操作者的管理")
+	}
+	enable := a.kind == "setadmin"
+	if _, err := p.callAPI("set_group_admin", map[string]any{
+		"group_id": groupID,
+		"user_id":  a.target,
+		"enable":   enable,
+	}); err != nil {
+		action := map[bool]string{true: "设置", false: "取消"}[enable]
+		return fmt.Errorf("%s群管理失败：%v", action, err)
+	}
+	slog.Info("qq: moderation", "group", groupID, "action", a.kind, "target", a.target)
+	return nil
+}
+
+// moderateMute mutes (or, with duration 0, unmutes) one member. Guards are the
+// point here: a hallucinated or manipulated target must not cost anyone their
+// voice, and an admin must not be vulnerable to a bot.
+func (p *Platform) moderateMute(rctx *replyContext, a moderationAction) error {
+	groupID := rctx.groupID
+	if a.target == 0 || a.target == p.selfID {
+		return fmt.Errorf("目标无效")
+	}
+	// The operator is never muted, even when the bot owns the group — otherwise a
+	// misfire could lock its own admin out with no way to ask for an unmute.
+	if a.kind == "mute" && p.isAdmin(a.target) {
+		return fmt.Errorf("无法禁言")
+	}
+	// A group owner outranks everyone, so the rank checks only apply when the bot
+	// is merely an admin.
+	botIsOwner := p.botIsGroupOwner(groupID)
+	// Membership is the hard check: it rejects invented QQ numbers, and it tells us
+	// whether the target outranks the bot.
+	role, err := p.groupMemberRole(groupID, a.target)
+	if err != nil {
+		return fmt.Errorf("查不到这个群成员")
+	}
+	if !botIsOwner && (role == "owner" || role == "admin") {
+		return fmt.Errorf("不能处理群主或管理员")
+	}
+	duration := 0
+	if a.kind == "mute" {
+		duration = a.minutes
+		if duration <= 0 {
+			duration = p.muteMaxMinutes
+		}
+		if duration > p.muteMaxMinutes {
+			duration = p.muteMaxMinutes
+		}
+		duration *= 60
+	}
+	if _, err := p.callAPI("set_group_ban", map[string]any{
+		"group_id": groupID,
+		"user_id":  a.target,
+		"duration": duration,
+	}); err != nil {
+		return fmt.Errorf("%s失败：%v", map[string]string{"mute": "禁言", "unmute": "解禁"}[a.kind], err)
+	}
+	slog.Info("qq: moderation", "group", groupID, "action", a.kind, "target", a.target, "duration_s", duration)
+	return nil
+}
+
+// moderateRecall deletes the message this reply is answering. It refuses when that
+// message came from an admin, so a prompt-injected reply cannot erase the boss.
+func (p *Platform) moderateRecall(rctx *replyContext) error {
+	if rctx.messageID == 0 {
+		return fmt.Errorf("没有可撤回的消息")
+	}
+	p.recentMessagesMu.Lock()
+	entry := p.recentMessages[int64(rctx.messageID)]
+	p.recentMessagesMu.Unlock()
+	if entry == nil {
+		// Without the sender on record we cannot rule out an admin's message.
+		return fmt.Errorf("无法确认要撤回的消息")
+	}
+	if entry.userID == p.selfID {
+		return fmt.Errorf("不能撤回自己的消息")
+	}
+	if !p.botIsGroupOwner(rctx.groupID) && p.isAdmin(entry.userID) {
+		return fmt.Errorf("不能撤回管理员的消息")
+	}
+	if _, err := p.callAPI("delete_msg", map[string]any{
+		"message_id": rctx.messageID,
+	}); err != nil {
+		return fmt.Errorf("撤回失败：%v", err)
+	}
+	slog.Info("qq: moderation", "group", rctx.groupID, "action", "recall", "message", rctx.messageID)
+	return nil
+}
+
+// botGroupRole returns the bot's role in the group, cached for five minutes so
+// the per-message hint does not require an API call every time.
+func (p *Platform) botGroupRole(groupID int64) string {
+	p.roleMu.Lock()
+	if e, ok := p.botGroupRoles[groupID]; ok && time.Since(e.checkedAt) < 5*time.Minute {
+		p.roleMu.Unlock()
+		return e.role
+	}
+	p.roleMu.Unlock()
+
+	if p.selfID == 0 {
+		return ""
+	}
+	role, err := p.groupMemberRole(groupID, p.selfID)
+	if err != nil {
+		return ""
+	}
+	p.roleMu.Lock()
+	p.botGroupRoles[groupID] = groupRoleEntry{role: role, checkedAt: time.Now()}
+	p.roleMu.Unlock()
+	return role
+}
+
+// botIsGroupOwner reports whether the bot itself owns the group. Queried per
+// action — moderation is rate-limited, so the extra call is cheap.
+func (p *Platform) botIsGroupOwner(groupID int64) bool {
+	if p.selfID == 0 {
+		return false
+	}
+	role, err := p.groupMemberRole(groupID, p.selfID)
+	return err == nil && role == "owner"
+}
+
+func (p *Platform) groupMemberRole(groupID, userID int64) (string, error) {
+	data, err := p.callAPI("get_group_member_info", map[string]any{
+		"group_id": groupID,
+		"user_id":  userID,
+		"no_cache": true,
+	})
+	if err != nil {
+		return "", err
+	}
+	role, _ := data["role"].(string)
+	return role, nil
+}
+
+// botPeerMention returns the first mentioned uid that is a configured bot peer.
+func (p *Platform) botPeerMention(content string) (int64, bool) {
+	for _, m := range atMarker.FindAllStringSubmatch(content, -1) {
+		uid, err := strconv.ParseInt(m[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		if p.botPeers[uid] {
+			return uid, true
+		}
+	}
+	return 0, false
+}
+
+// atSegments splits content into text and at segments. ok is false when the text
+// carries no marker, so the common case keeps sending a plain string.
+func atSegments(content string) ([]map[string]any, bool) {
+	matches := atMarker.FindAllStringSubmatchIndex(content, -1)
+	if len(matches) == 0 {
+		return nil, false
+	}
+	segments := make([]map[string]any, 0, 2*len(matches))
+	pos := 0
+	for _, m := range matches {
+		if m[0] > pos {
+			segments = append(segments, map[string]any{
+				"type": "text", "data": map[string]any{"text": content[pos:m[0]]},
+			})
+		}
+		segments = append(segments, map[string]any{
+			"type": "at", "data": map[string]any{"qq": content[m[2]:m[3]]},
+		})
+		pos = m[1]
+	}
+	if pos < len(content) {
+		segments = append(segments, map[string]any{
+			"type": "text", "data": map[string]any{"text": content[pos:]},
+		})
+	}
+	return segments, true
+}
+
+// SendImage sends an image to the conversation.
+// Implements core.ImageSender.
+func (p *Platform) SendImage(ctx context.Context, replyCtx any, img core.ImageAttachment) error {
+	rctx, ok := replyCtx.(*replyContext)
+	if !ok {
+		return fmt.Errorf("qq: SendImage: invalid reply context type %T", replyCtx)
+	}
+
+	b64 := base64.StdEncoding.EncodeToString(img.Data)
+	segments := []map[string]any{
+		{"type": "image", "data": map[string]any{"file": "base64://" + b64}},
+	}
+
+	params := map[string]any{
+		"message": segments,
+	}
+
+	if rctx.messageType == "group" {
+		params["group_id"] = rctx.groupID
+		_, err := p.callAPI("send_group_msg", params)
+		if err != nil {
+			return fmt.Errorf("qq: send image: %w", err)
+		}
+		return nil
+	}
+
+	params["user_id"] = rctx.userID
+	_, err := p.callAPI("send_private_msg", params)
+	if err != nil {
+		return fmt.Errorf("qq: send image: %w", err)
+	}
+	return nil
+}
+
+var _ core.ImageSender = (*Platform)(nil)
+
+func (p *Platform) Stop() error {
+	if p.cancel != nil {
+		p.cancel()
+	}
+	p.stopCronJobs()
+	if p.conn != nil {
+		return p.conn.Close()
+	}
+	return nil
+}
+
+func (p *Platform) resolveGroupName(groupID int64) string {
+	if groupID == 0 {
+		return ""
+	}
+	fallback := strconv.FormatInt(groupID, 10)
+	if cached, ok := p.groupNameCache.Load(fallback); ok {
+		return cached.(string)
+	}
+	result, err := p.callAPI("get_group_info", map[string]any{"group_id": groupID})
+	if err != nil {
+		slog.Debug("qq: resolve group name failed", "group_id", groupID, "error", err)
+		return fallback
+	}
+	name, _ := result["group_name"].(string)
+	if name != "" {
+		p.groupNameCache.Store(fallback, name)
+		return name
+	}
+	return fallback
+}
+
+// ── OneBot API call via WebSocket ───────────────────────────────
+
+func (p *Platform) callAPI(action string, params map[string]any) (map[string]any, error) {
+	raw, err := p.callAPIRaw(action, params)
+	if err != nil {
+		return nil, err
+	}
+	// Some actions answer with an array (get_rkey); callers that only expect an
+	// object get a nil map rather than an error.
+	var result map[string]any
+	_ = json.Unmarshal(raw, &result)
+	return result, nil
+}
+
+// callAPIRaw performs the request and returns the raw "data" field, whatever its
+// JSON shape.
+func (p *Platform) callAPIRaw(action string, params map[string]any) (json.RawMessage, error) {
+	seq := p.echoSeq.Add(1)
+	echo := strconv.FormatInt(seq, 10)
+
+	req := map[string]any{
+		"action": action,
+		"echo":   echo,
+	}
+	if params != nil {
+		req["params"] = params
+	}
+
+	ch := make(chan json.RawMessage, 1)
+	p.echoCh.Store(echo, ch)
+	defer p.echoCh.Delete(echo)
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	p.mu.Lock()
+	conn := p.conn
+	if conn == nil {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("qq: %s: not connected", action)
+	}
+	err = conn.WriteMessage(websocket.TextMessage, data)
+	p.mu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("qq: ws write: %w", err)
+	}
+
+	select {
+	case raw := <-ch:
+		var resp struct {
+			Status  string          `json:"status"`
+			RetCode int             `json:"retcode"`
+			Data    json.RawMessage `json:"data"`
+		}
+		if json.Unmarshal(raw, &resp) != nil {
+			return nil, fmt.Errorf("qq: invalid API response")
+		}
+		if resp.RetCode != 0 {
+			return nil, fmt.Errorf("qq: API %s failed (retcode=%d)", action, resp.RetCode)
+		}
+		return resp.Data, nil
+
+	case <-time.After(15 * time.Second):
+		return nil, fmt.Errorf("qq: API %s timeout", action)
+	}
+}
+
+// ── Group features ────────────────────────────────────────────
+
+// handleGroupRecall handles group_recall events — routes through AI for dynamic response.
+func (p *Platform) handleGroupRecall(payload map[string]any) {
+	if !p.recallComment {
+		return
+	}
+	if !p.scopeAllows("group") {
+		return
+	}
+
+	groupID := jsonInt64(payload, "group_id")
+	operatorID := jsonInt64(payload, "operator_id")
+	messageID := jsonInt64(payload, "message_id")
+
+	if groupID == 0 || !p.isGroupAllowed(groupID) {
+		return
+	}
+
+	if ts, ok := payload["time"].(float64); ok && ts > 0 {
+		if core.IsOldMessage(time.Unix(int64(ts), 0)) {
+			return
+		}
+	}
+
+	// Bot recalling its own message — ignore
+	if operatorID == p.selfID {
+		return
+	}
+
+	// Build recall context for the AI
+	prompt := "有人撤回了消息"
+	if entry := p.lookupMessage(messageID); entry != nil && entry.content != "" {
+		prompt = "有人撤回了消息，内容大概是：「" + truncateText(entry.content, 50) + "」"
+	}
+
+	sessionKey := fmt.Sprintf("qq:g:%d", groupID)
+	rctx := &replyContext{messageType: "group", groupID: groupID, persona: p.personaFor(sessionKey)}
+	msg := &core.Message{
+		SessionKey:   sessionKey,
+		Platform:     "qq",
+		MessageID:    fmt.Sprintf("recall_%d_%d", groupID, time.Now().UnixMilli()),
+		UserID:       strconv.FormatInt(p.selfID, 10),
+		ChatName:     p.resolveGroupName(groupID),
+		Content:      prompt,
+		ExtraContent: p.makeGroupExtraContent(sessionKey),
+		ReplyCtx:     rctx,
+	}
+	slog.Debug("qq: group recall handled", "group", groupID, "message_id", messageID)
+	p.handler(p, msg)
+}
+
+// trackMessage caches a recent message for recall content lookup.
+func (p *Platform) trackMessage(messageID int64, userID int64, content string) {
+	p.recentMessagesMu.Lock()
+	defer p.recentMessagesMu.Unlock()
+
+	// Evict old entries if cache is too large
+	if len(p.recentMessages) >= 500 {
+		oldest := int64(0)
+		var oldestKey int64
+		for id, entry := range p.recentMessages {
+			if oldest == 0 || entry.timestamp.Unix() < oldest {
+				oldest = entry.timestamp.Unix()
+				oldestKey = id
+			}
+		}
+		delete(p.recentMessages, oldestKey)
+	}
+
+	p.recentMessages[messageID] = &recallEntry{
+		userID:    userID,
+		content:   content,
+		timestamp: time.Now(),
+	}
+}
+
+// lookupMessage retrieves a cached message for recall detection.
+func (p *Platform) lookupMessage(messageID int64) *recallEntry {
+	p.recentMessagesMu.Lock()
+	defer p.recentMessagesMu.Unlock()
+	entry, ok := p.recentMessages[messageID]
+	if !ok {
+		return nil
+	}
+	// Expire entries older than 5 minutes
+	if time.Since(entry.timestamp) > 5*time.Minute {
+		delete(p.recentMessages, messageID)
+		return nil
+	}
+	return entry
+}
+
+// addEmojiLike adds an emoji reaction to a message (NapCat extended API).
+// If emojiID is empty, uses the configured default ("76" = thumbs up).
+// Skips if already reacted to this message (checked via emojiReacted map).
+func (p *Platform) addEmojiLike(messageID int64, emojiID string) {
+	if emojiID == "" {
+		emojiID = p.emojiLikeDef
+	}
+	if emojiID == "" {
+		emojiID = "76" // default thumbs up
+	}
+
+	msgKey := strconv.FormatInt(messageID, 10) + ":" + emojiID
+	if _, loaded := p.emojiReacted.LoadOrStore(msgKey, true); loaded {
+		return // already reacted with this emoji
+	}
+
+	slog.Debug("qq: set_msg_emoji_like", "message_id", messageID, "emoji_id", emojiID)
+	_, err := p.callAPI("set_msg_emoji_like", map[string]any{
+		"message_id": messageID,
+		"emoji_id":   emojiID,
+	})
+	if err != nil {
+		slog.Debug("qq: set_msg_emoji_like failed", "error", err)
+	}
+}
+
+// ── Mute check ────────────────────────────────────────────────
+
+// isMutedInGroup checks if the bot is muted in the given group, with caching.
+func (p *Platform) isMutedInGroup(groupID int64) bool {
+	cacheKey := strconv.FormatInt(groupID, 10)
+
+	// Check cache first
+	if cached, ok := p.muteCache.Load(cacheKey); ok {
+		entry := cached.(*muteCacheEntry)
+		if time.Since(entry.cachedAt) < 15*time.Second {
+			return entry.isMuted
+		}
+	}
+
+	// Fetch from API
+	result, err := p.callAPI("get_group_member_info", map[string]any{
+		"group_id": groupID,
+		"user_id":  p.selfID,
+	})
+	if err != nil {
+		slog.Debug("qq: check mute failed", "group_id", groupID, "error", err)
+		return false
+	}
+
+	shutUpTs, _ := result["shut_up_timestamp"].(float64)
+	until := time.Unix(int64(shutUpTs), 0)
+	isMuted := shutUpTs > 0 && until.After(time.Now())
+
+	p.muteCache.Store(cacheKey, &muteCacheEntry{
+		isMuted:  isMuted,
+		until:    until,
+		cachedAt: time.Now(),
+	})
+
+	if isMuted {
+		slog.Debug("qq: bot is muted in group", "group_id", groupID, "until", until)
+	}
+	return isMuted
+}
+
+// ── Cron scheduled messages ───────────────────────────────────
+
+func (p *Platform) startCronJobs() {
+	if len(p.cronJobs) == 0 {
+		return
+	}
+
+	p.cronScheduler = cron.New()
+	for i, job := range p.cronJobs {
+		idx := i
+		j := job
+		_, err := p.cronScheduler.AddFunc(j.Cron, func() {
+			if j.Message != "" {
+				p.executeCronMessage(j)
+				return
+			}
+			p.executeCronJob(j.GroupID, j.Prompt, idx)
+		})
+		if err != nil {
+			slog.Error("qq: invalid cron expression", "cron", j.Cron, "error", err)
+			continue
+		}
+		if j.Message != "" {
+			slog.Info("qq: cron message registered",
+				"cron", j.Cron, "group", j.GroupID, "at", j.At, "message", truncateText(j.Message, 40))
+			continue
+		}
+		slog.Info("qq: cron prompt registered", "cron", j.Cron, "group", j.GroupID, "prompt", truncateText(j.Prompt, 40))
+	}
+	p.cronScheduler.Start()
+}
+
+func (p *Platform) stopCronJobs() {
+	if p.cronScheduler != nil {
+		p.cronScheduler.Stop()
+	}
+}
+
+// executeCronMessage sends a fixed group message on a schedule, optionally
+// @-mentioning someone first. It deliberately bypasses the agent: jobs like this
+// exist to poke another bot's command (e.g. "@otherbot /签到"), so the text has
+// to go out exactly as configured, and the mention has to be a real at-segment
+// rather than plain text that no bot would recognise.
+func (p *Platform) executeCronMessage(job cronJobConfig) {
+	if !p.scopeAllows("group") {
+		slog.Debug("qq: skipping scheduled message, groups are out of scope", "group", job.GroupID)
+		return
+	}
+	if p.checkMute && p.isMutedInGroup(job.GroupID) {
+		slog.Debug("qq: skipping scheduled message, bot is muted", "group", job.GroupID)
+		return
+	}
+
+	segments := make([]map[string]any, 0, 2)
+	if job.At != 0 {
+		segments = append(segments, map[string]any{
+			"type": "at",
+			"data": map[string]any{"qq": strconv.FormatInt(job.At, 10)},
+		})
+	}
+	segments = append(segments, map[string]any{
+		"type": "text",
+		"data": map[string]any{"text": job.Message},
+	})
+
+	if _, err := p.callAPI("send_group_msg", map[string]any{
+		"group_id": job.GroupID,
+		"message":  segments,
+	}); err != nil {
+		slog.Error("qq: scheduled message failed", "group", job.GroupID, "error", err)
+		return
+	}
+	slog.Info("qq: scheduled message sent",
+		"group", job.GroupID, "at", job.At, "message", truncateText(job.Message, 40))
+}
+
+func (p *Platform) executeCronJob(groupID int64, prompt string, _ int) {
+	if !p.scopeAllows("group") {
+		slog.Debug("qq: skipping cron job, groups are out of scope", "group", groupID)
+		return
+	}
+
+	// Route through the AI handler so content is dynamically generated
+	sessionKey := fmt.Sprintf("qq:g:%d", groupID)
+	rctx := &replyContext{messageType: "group", groupID: groupID, persona: p.personaFor(sessionKey)}
+	msg := &core.Message{
+		SessionKey:   sessionKey,
+		Platform:     "qq",
+		MessageID:    fmt.Sprintf("cron_%d_%d", groupID, time.Now().UnixMilli()),
+		UserID:       strconv.FormatInt(p.selfID, 10),
+		ChatName:     p.resolveGroupName(groupID),
+		Content:      prompt,
+		ExtraContent: p.makeGroupExtraContent(sessionKey),
+		ReplyCtx:     rctx,
+	}
+	slog.Info("qq: cron job executing", "group", groupID, "prompt", truncateText(prompt, 60))
+	p.handler(p, msg)
+}
+
+// defaultPersona is used when a group session has no /persona override. It has to
+// name a persona the prompt actually describes — TestDefaultPersonaIsSelectable
+// guards that.
+const defaultPersona = "大肥鱼"
+
+// personaFor returns the persona tag for a session, falling back to the default.
+func (p *Platform) personaFor(sessionKey string) string {
+	if tag, ok := p.personaMap.Load(sessionKey); ok {
+		if s, ok := tag.(string); ok && s != "" {
+			return s
+		}
+	}
+	return defaultPersona
+}
+
+func (p *Platform) makeGroupExtraContent(sessionKey string) string {
+	extra := "[群聊消息][" + p.personaFor(sessionKey) + "][" + timeContext() + "]"
+	if gid, ok := groupIDFromSessionKey(sessionKey); ok && p.moderationGroups[gid] {
+		switch p.botGroupRole(gid) {
+		case "owner":
+			extra += "[群管:群主]"
+		case "admin":
+			extra += "[群管:管理员]"
+		default:
+			extra += "[群管]"
+		}
+	}
+	if hint := p.observedBotsHint(); hint != "" {
+		extra += hint
+	}
+	return extra
+}
+
+// RoleHint returns the moderation marker for a session, e.g. "[群管:群主]", or
+// "" when the group is not moderation-enabled. The chat harness prepends this to
+// the current message so the model knows its rank, matching the prompt rules.
+func (p *Platform) RoleHint(sessionKey string) string {
+	gid, ok := groupIDFromSessionKey(sessionKey)
+	if !ok || !p.moderationGroups[gid] {
+		return ""
+	}
+	switch p.botGroupRole(gid) {
+	case "owner":
+		return "[群管:群主]"
+	case "admin":
+		return "[群管:管理员]"
+	default:
+		return "[群管]"
+	}
+}
+
+// groupIDFromSessionKey extracts the group id from both session-key shapes:
+// "qq:g:<gid>" (shared channel session) and "qq:<gid>:<uid>" (per-user session).
+func groupIDFromSessionKey(key string) (int64, bool) {
+	parts := strings.Split(key, ":")
+	if len(parts) != 3 {
+		return 0, false
+	}
+	raw := parts[1]
+	if raw == "g" {
+		raw = parts[2]
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	return id, err == nil
+}
+
+// observedBotsHint summarises what we learned about other bots, so the agent knows
+// how to use them without that being hardcoded in the prompt.
+func (p *Platform) observedBotsHint() string {
+	p.observedMu.Lock()
+	defer p.observedMu.Unlock()
+	if len(p.observed) == 0 {
+		return ""
+	}
+	type entry struct {
+		uid int64
+		ob  *observedBot
+	}
+	entries := make([]entry, 0, len(p.observed))
+	for uid, ob := range p.observed {
+		entries = append(entries, entry{uid, ob})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ob.lastSeen.After(entries[j].ob.lastSeen) })
+	if len(entries) > 3 {
+		entries = entries[:3]
+	}
+	parts := make([]string, 0, len(entries))
+	for _, e := range entries {
+		name := p.seenNames[e.uid]
+		if name == "" {
+			name = strconv.FormatInt(e.uid, 10)
+		}
+		parts = append(parts, fmt.Sprintf("%s(%d)「%s」", name, e.uid, e.ob.command))
+	}
+	return "[本群其他机器人：" + strings.Join(parts, "；") + "]"
+}
+
+// observe learns which command targets which bot from traffic we do not answer.
+// It must never reply: it only records.
+func (p *Platform) observe(payload map[string]any, userID int64, userName string) {
+	segs, _ := payload["message"].([]any)
+	if len(segs) == 0 {
+		return
+	}
+	p.observedMu.Lock()
+	defer p.observedMu.Unlock()
+
+	if userName != "" {
+		p.seenNames[userID] = userName
+	}
+	for i, seg := range segs {
+		s, ok := seg.(map[string]any)
+		if !ok || s["type"] != "at" {
+			continue
+		}
+		data, _ := s["data"].(map[string]any)
+		qq, _ := data["qq"].(string)
+		target, err := strconv.ParseInt(qq, 10, 64)
+		if err != nil || target == 0 || target == p.selfID {
+			continue
+		}
+		// The command is the first text segment right after the mention.
+		for _, next := range segs[i+1:] {
+			n, ok := next.(map[string]any)
+			if !ok || n["type"] != "text" {
+				continue
+			}
+			nd, _ := n["data"].(map[string]any)
+			t, _ := nd["text"].(string)
+			t = strings.TrimSpace(t)
+			if t == "" {
+				continue
+			}
+			if !strings.HasPrefix(t, "/") {
+				break
+			}
+			cmd := strings.Fields(t)[0]
+			if ob, ok := p.observed[target]; ok {
+				ob.command = cmd
+				ob.lastSeen = time.Now()
+			} else {
+				if len(p.observed) >= maxObservedBots {
+					p.evictOldestObservedLocked()
+				}
+				p.observed[target] = &observedBot{command: cmd, lastSeen: time.Now()}
+			}
+			break
+		}
+	}
+}
+
+func (p *Platform) evictOldestObservedLocked() {
+	var oldestUID int64
+	var oldest time.Time
+	for uid, ob := range p.observed {
+		if oldest.IsZero() || ob.lastSeen.Before(oldest) {
+			oldest, oldestUID = ob.lastSeen, uid
+		}
+	}
+	delete(p.observed, oldestUID)
+}
+
+// gameStatus reports an active game without extending it.
+func (p *Platform) gameStatus(groupID int64) (int64, time.Duration, bool) {
+	p.gameMu.Lock()
+	defer p.gameMu.Unlock()
+	raw, ok := p.games.Load(groupID)
+	if !ok {
+		return 0, 0, false
+	}
+	g := raw.(*gameState)
+	if time.Now().After(g.expiresAt) {
+		p.games.Delete(groupID)
+		return 0, 0, false
+	}
+	return g.peer, time.Until(g.expiresAt), true
+}
+
+// handleGameCommand lets an admin inspect or end the active bot game.
+func (p *Platform) handleGameCommand(rctx *replyContext, userID int64, text string, groupID int64) {
+	reply := func(msg string) {
+		if err := p.Reply(context.Background(), rctx, msg); err != nil {
+			slog.Warn("qq: reply to /game failed", "error", err)
+		}
+	}
+	if !p.isAdmin(userID) {
+		reply("❌ 只有管理员能操作游戏状态。")
+		return
+	}
+	arg := strings.TrimSpace(strings.TrimSpace(text)[len("/game"):])
+	switch arg {
+	case "end", "stop", "结束":
+		p.clearGame(groupID)
+		reply("✅ 游戏已结束，机器人只理会人类了。")
+	case "":
+		if peer, left, ok := p.gameStatus(groupID); ok {
+			reply(fmt.Sprintf("🎮 正在和 %d 玩（%d 分钟后自动结束）。发 /game end 可手动结束。",
+				peer, int(left.Minutes())))
+		} else {
+			reply("当前没有进行中的游戏。")
+		}
+	default:
+		reply("用法：/game 查看状态，/game end 结束。")
+	}
+}
+
+// handleBotsCommand dumps what we passively learned about other bots.
+func (p *Platform) handleBotsCommand(rctx *replyContext, userID int64) {
+	reply := func(msg string) {
+		if err := p.Reply(context.Background(), rctx, msg); err != nil {
+			slog.Warn("qq: reply to /bots failed", "error", err)
+		}
+	}
+	if !p.isAdmin(userID) {
+		reply("❌ 只有管理员能查看。")
+		return
+	}
+	hint := p.observedBotsHint()
+	if hint == "" {
+		reply("还没观察到别的机器人的用法。")
+		return
+	}
+	reply("学到的机器人：" + hint)
+}
+
+// timeContext renders the current local time so the agent has a clock. Without it
+// the model can only guess "now" from its training data, which makes it useless
+// for anything hour-dependent ("都这个点了还不睡?" / "现在几点").
+func timeContext() string {
+	weekdays := [...]string{"周日", "周一", "周二", "周三", "周四", "周五", "周六"}
+	now := time.Now()
+	return now.Format("2006-01-02 15:04") + " " + weekdays[now.Weekday()]
+}
+
+// ── Message buffer ──────────────────────────────
+
+func (p *Platform) addToBuffer(sessionKey string, userName string, userID int64, text string) {
+	if userName != "" {
+		p.addSystemBufferLine(sessionKey, fmt.Sprintf("%s(%d): %s", userName, userID, text))
+	} else {
+		p.addSystemBufferLine(sessionKey, fmt.Sprintf("(%d): %s", userID, text))
+	}
+}
+
+// addSystemBufferLine appends a pre-formatted line (a message or a system notice
+// such as a mute) to the group's buffer.
+func (p *Platform) addSystemBufferLine(sessionKey, line string) {
+	raw, _ := p.msgBufferMap.LoadOrStore(sessionKey, &msgBuffer{lines: []string{}, start: time.Now()})
+	buf := raw.(*msgBuffer)
+	buf.mu.Lock()
+	buf.lines = append(buf.lines, line)
+	buf.mu.Unlock()
+}
+
+// bufferedText returns the current buffer contents, for tests and diagnostics.
+func (p *Platform) bufferedText(sessionKey string) string {
+	raw, ok := p.msgBufferMap.Load(sessionKey)
+	if !ok {
+		return ""
+	}
+	buf := raw.(*msgBuffer)
+	buf.mu.Lock()
+	defer buf.mu.Unlock()
+	return strings.Join(buf.lines, "\n")
+}
+
+// flushBuffer returns all buffered messages as a single string and clears the buffer.
+func (p *Platform) flushBuffer(sessionKey string) string {
+	raw, ok := p.msgBufferMap.Load(sessionKey)
+	if !ok {
+		return ""
+	}
+	buf := raw.(*msgBuffer)
+	buf.mu.Lock()
+	defer buf.mu.Unlock()
+
+	// Check freshness: if buffer is older than 30 min, discard
+	if time.Since(buf.start) > 30*time.Minute {
+		p.msgBufferMap.Delete(sessionKey)
+		return ""
+	}
+
+	if len(buf.lines) <= 1 {
+		// Only current message, no need for special formatting
+		p.msgBufferMap.Delete(sessionKey)
+		return ""
+	}
+
+	result := "以下是你上次回复之后的群聊记录：\n\n"
+	for _, line := range buf.lines {
+		result += line + "\n"
+	}
+	p.msgBufferMap.Delete(sessionKey)
+	return result
+}
+
+// ── Deferred attachments ────────────────────────
+
+// stashImages remembers pictures that arrived while the session was throttled.
+func (p *Platform) stashImages(sessionKey string, images []core.ImageAttachment) {
+	if len(images) == 0 {
+		return
+	}
+	p.pendingMu.Lock()
+	defer p.pendingMu.Unlock()
+	if p.pendingImages == nil {
+		p.pendingImages = map[string]*pendingAttachments{}
+	}
+	entry, ok := p.pendingImages[sessionKey]
+	if !ok || time.Since(entry.firstSeen) > pendingAttachmentTTL {
+		entry = &pendingAttachments{firstSeen: time.Now()}
+		p.pendingImages[sessionKey] = entry
+	}
+	entry.images = append(entry.images, images...)
+	if len(entry.images) > maxPendingImages {
+		entry.images = entry.images[len(entry.images)-maxPendingImages:]
+	}
+}
+
+// takeImages returns and clears the pictures deferred for this session. Pictures
+// that waited past the TTL are dropped rather than attached to an unrelated reply.
+func (p *Platform) takeImages(sessionKey string) []core.ImageAttachment {
+	p.pendingMu.Lock()
+	defer p.pendingMu.Unlock()
+	entry, ok := p.pendingImages[sessionKey]
+	if !ok {
+		return nil
+	}
+	delete(p.pendingImages, sessionKey)
+	if time.Since(entry.firstSeen) > pendingAttachmentTTL {
+		return nil
+	}
+	return entry.images
+}
+
+// ── Reply probability ───────────────────────────
+
+// replyStateFor returns the per-session throttling state, creating it on first use.
+func (p *Platform) replyStateFor(sessionKey string) *replyState {
+	raw, _ := p.replyStateMap.LoadOrStore(sessionKey, &replyState{})
+	return raw.(*replyState)
+}
+
+// inCooldown reports whether the bot spoke too recently to speak again here.
+// Only replies to messages that did not address the bot advance the clock, so
+// being @-mentioned is never suppressed.
+func (p *Platform) inCooldown(rs *replyState, now time.Time) bool {
+	return p.replyCooldown > 0 && !rs.lastReplyTime.IsZero() &&
+		now.Sub(rs.lastReplyTime) < time.Duration(p.replyCooldown)*time.Second
+}
+
+func (p *Platform) shouldReply(sessionKey string, text string) bool {
+	rs := p.replyStateFor(sessionKey)
+
+	now := time.Now()
+
+	// Cooldown: stay quiet for a while after speaking so the bot does not weigh in
+	// on every ambient message. Only messages that did not address the bot reach
+	// this point, so a direct @-mention is never suppressed by it.
+	if p.inCooldown(rs, now) {
+		rs.skipCount++
+		slog.Info("qq: skip, cooldown",
+			"session", sessionKey, "since_last_reply_s", int(now.Sub(rs.lastReplyTime).Seconds()),
+			"text", truncateText(text, 20))
+		return false
+	}
+
+	// Calculate probability
+	P := float64(p.replyProbability)
+
+	// 1. Skip penalty: each skipped message reduces probability
+	skipDeduction := float64(rs.skipCount) * float64(p.replySkipPenalty)
+	P -= skipDeduction
+
+	// 2. Cold boost: silence after last reply increases probability
+	if !rs.lastReplyTime.IsZero() {
+		silence := now.Sub(rs.lastReplyTime)
+		if silence > 30*time.Second {
+			extra := float64(silence.Seconds()-30) / 10.0 * float64(p.replyColdBoost)
+			P += extra
+		}
+	}
+
+	// Clamp
+	minP := float64(p.replyProbMin)
+	maxP := float64(p.replyProbMax)
+	if P < minP {
+		P = minP
+	}
+	if P > maxP {
+		P = maxP
+	}
+
+	// Content-based modifiers
+	// Questions: double probability
+	if strings.Contains(text, "?") || strings.Contains(text, "？") ||
+		strings.Contains(text, "吗") || strings.Contains(text, "什么") ||
+		strings.Contains(text, "啥") || strings.Contains(text, "怎么") {
+		P *= 2
+		if P > maxP {
+			P = maxP
+		}
+	}
+
+	// Short / pure emoji: halve probability
+	if len([]rune(text)) <= 2 {
+		P /= 2
+		if P < minP {
+			P = minP
+		}
+	}
+
+	// Roll the dice
+	replied := rand.Float64()*100 < P
+	slog.Info("qq: reply prob",
+		"prob", int(P),
+		"skip", rs.skipCount,
+		"text", truncateText(text, 20),
+		"reply", replied)
+
+	if replied {
+		// Replied: reset state
+		rs.skipCount = 0
+		rs.lastReplyTime = now
+		return true
+	}
+
+	// Skipped: increment counter (state persists for next message)
+	rs.skipCount++
+	return false
+}
+
+// ── Voice transcription ─────────────────────────
+
+// transcribeAudio downloads an audio file and runs Whisper via FFmpeg pipe to get text.
+func (p *Platform) transcribeAudio(url string) string {
+	data, _, err := downloadFile(url)
+	if err != nil {
+		slog.Info("qq: whisper download failed", "error", err)
+		return ""
+	}
+
+	// Write raw audio to temp file
+	rawFile := filepath.Join(os.TempDir(), fmt.Sprintf("qq_raw_%d", time.Now().UnixNano()))
+	if err := os.WriteFile(rawFile, data, 0644); err != nil {
+		slog.Info("qq: whisper write failed", "error", err)
+		return ""
+	}
+	defer os.Remove(rawFile)
+
+	// Convert to WAV via FFmpeg (AMR/SILK → PCM)
+	wavFile := rawFile + ".wav"
+	defer os.Remove(wavFile)
+
+	ffmpeg := exec.Command("ffmpeg", "-y", "-i", rawFile, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wavFile)
+	if err := ffmpeg.Run(); err != nil {
+		slog.Info("qq: whisper ffmpeg convert failed", "error", err)
+		return ""
+	}
+
+	outFile := rawFile + ".txt"
+	defer os.Remove(outFile)
+
+	cmd := exec.Command("whisper-cli",
+		"-m", p.whisperModel,
+		"-f", wavFile,
+		"-of", rawFile,
+		"-otxt",
+		"-l", "zh",
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		slog.Warn("qq: whisper failed", "error", err, "output", string(output))
+		return ""
+	}
+
+	transcript, err := os.ReadFile(outFile)
+	if err != nil {
+		slog.Info("qq: whisper read output failed", "error", err)
+		return ""
+	}
+
+	result := strings.TrimSpace(string(transcript))
+	slog.Info("qq: whisper transcript", "text", truncateText(result, 60))
+	return result
+}
+
+// ── Voice (TTS) ─────────────────────────────────
+
+// SendAudio sends a synthesized voice message. Synthesis itself is done by the
+// engine's TTS pipeline; the platform only converts to a format NapCat accepts
+// and hands it to OneBot. Implements core.AudioSender.
+func (p *Platform) SendAudio(ctx context.Context, replyCtx any, audio []byte, format string) error {
+	rctx, ok := replyCtx.(*replyContext)
+	if !ok {
+		return fmt.Errorf("qq: SendAudio: invalid reply context type %T", replyCtx)
+	}
+	if len(audio) == 0 {
+		return fmt.Errorf("qq: SendAudio: empty audio")
+	}
+
+	// Providers emit WAV or MP3; NapCat's record segment wants MP3.
+	data := audio
+	if !strings.EqualFold(format, "mp3") {
+		converted, err := core.ConvertAudioToMP3(ctx, audio, format)
+		if err != nil {
+			return fmt.Errorf("qq: convert %s audio to mp3: %w", format, err)
+		}
+		data = converted
+	}
+
+	b64 := base64.StdEncoding.EncodeToString(data)
+	params := map[string]any{
+		"message": []map[string]any{
+			{"type": "record", "data": map[string]any{"file": "base64://" + b64}},
+		},
+	}
+
+	if rctx.messageType == "group" {
+		params["group_id"] = rctx.groupID
+		_, err := p.callAPI("send_group_msg", params)
+		return err
+	}
+	params["user_id"] = rctx.userID
+	_, err := p.callAPI("send_private_msg", params)
+	return err
+}
+
+// SelectVoice returns the TTS voice configured for the speaker's current
+// persona, or "" to fall back to the global [tts] voice.
+// Implements core.VoiceSelector.
+func (p *Platform) SelectVoice(replyCtx any) string {
+	rctx, ok := replyCtx.(*replyContext)
+	if !ok || rctx.persona == "" {
+		return ""
+	}
+	return p.personaVoices[rctx.persona]
+}
+
+// voiceNoiseRE matches adapter-only markers. They are instructions (mute, @,
+// game state, emoji reaction) executed on the text send path — never speech.
+var voiceNoiseRE = regexp.MustCompile(`\[(?:mute|unmute|setadmin|unsetadmin):\d+(?::\d+)?\]|\[recall\]|\[game:[^\]]*\]|\[at:\d+\]|\[emoji:\d+\]`)
+
+// HasActionMarkers reports whether text carries adapter markers that must go
+// through the text send path (they trigger actions and are never speech).
+func HasActionMarkers(text string) bool { return voiceNoiseRE.MatchString(text) }
+
+// AllowVoice thins out voice replies by probability so the group does not get
+// spoken word for every message. A reply that answers a voice message is always
+// spoken; otherwise voiceProbability applies (0 = never gate, i.e. always allow).
+// Private chats are the operator's own workspace and stay text-only.
+// Implements core.VoiceGate.
+func (p *Platform) AllowVoice(replyCtx any, text string, fromVoice bool) bool {
+	rctx, ok := replyCtx.(*replyContext)
+	if !ok || rctx.messageType != "group" {
+		return false
+	}
+	// Markers are executed only on the text send path. A voice reply would read
+	// them aloud and skip the action (mute, @-mention, game move), so any reply
+	// carrying one goes out as text instead.
+	if voiceNoiseRE.MatchString(text) {
+		return false
+	}
+	if fromVoice || p.voiceProbability <= 0 || p.voiceProbability >= 100 {
+		return true
+	}
+	return rand.Intn(100) < p.voiceProbability
+}
+
+var (
+	_ core.AudioSender   = (*Platform)(nil)
+	_ core.VoiceSelector = (*Platform)(nil)
+	_ core.VoiceGate     = (*Platform)(nil)
+)
+
+// ── Chat scope ──────────────────────────────────
+
+// currentScope returns the configured chat scope.
+func (p *Platform) currentScope() string {
+	p.scopeMu.Lock()
+	defer p.scopeMu.Unlock()
+	if p.chatScope == "" {
+		return chatScopeAll
+	}
+	return p.chatScope
+}
+
+// setScope switches the chat scope and persists it so the change survives a restart.
+func (p *Platform) setScope(scope string) {
+	p.scopeMu.Lock()
+	p.chatScope = scope
+	path := p.scopePath
+	p.scopeMu.Unlock()
+
+	if path == "" {
+		return
+	}
+	if err := saveChatScope(path, scope); err != nil {
+		slog.Warn("qq: persist chat scope failed", "path", path, "error", err)
+	}
+}
+
+// scopeAllows reports whether the bot answers in this kind of chat.
+func (p *Platform) scopeAllows(msgType string) bool {
+	switch p.currentScope() {
+	case chatScopeGroup:
+		return msgType == "group"
+	case chatScopePrivate:
+		return msgType == "private"
+	default:
+		return true
+	}
+}
+
+// scopeBlocks reports whether a message should be dropped for being outside the
+// configured scope. /scope always gets through so an admin can switch back even
+// when the chat they are typing in is currently out of scope.
+func (p *Platform) scopeBlocks(msgType, text string) bool {
+	if p.scopeAllows(msgType) {
+		return false
+	}
+	return !isCommand(text, "/scope")
+}
+
+// handleScopeCommand implements the admin-only /scope command.
+func (p *Platform) handleScopeCommand(rctx *replyContext, userID int64, text string) {
+	reply := func(msg string) {
+		if err := p.Reply(context.Background(), rctx, msg); err != nil {
+			slog.Warn("qq: reply to /scope failed", "error", err)
+		}
+	}
+
+	if !p.isAdmin(userID) {
+		if p.adminIDs == "" {
+			reply("❌ 还没配置 admin_ids，没人能切换生效范围。")
+		} else {
+			reply("❌ 只有管理员才能切换生效范围。")
+		}
+		return
+	}
+
+	arg := strings.TrimSpace(strings.TrimSpace(text)[len("/scope"):])
+	if arg == "" {
+		reply(fmt.Sprintf("当前生效范围: %s\n用法: /scope all|group|private（全部/群聊/私聊）", scopeLabel(p.currentScope())))
+		return
+	}
+
+	scope := parseChatScope(arg)
+	if scope == "" {
+		reply("❌ 参数无效。用法: /scope all|group|private（全部/群聊/私聊）")
+		return
+	}
+
+	p.setScope(scope)
+	slog.Info("qq: chat scope switched", "scope", scope, "by", userID)
+	reply("✅ 生效范围已切换为: " + scopeLabel(scope))
+}
+
+// parseChatScope normalizes a scope value, returning "" when it is not recognized.
+func parseChatScope(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "all", "both", "全部", "都":
+		return chatScopeAll
+	case "group", "群聊", "群":
+		return chatScopeGroup
+	case "private", "单聊", "私聊", "私":
+		return chatScopePrivate
+	}
+	return ""
+}
+
+func scopeLabel(scope string) string {
+	switch scope {
+	case chatScopeGroup:
+		return "仅群聊"
+	case chatScopePrivate:
+		return "仅私聊"
+	default:
+		return "私聊+群聊"
+	}
+}
+
+// isControlCommand reports whether text is a command rather than chat: either one
+// this adapter handles itself or one the engine dispatches. Anything else,
+// including "/" text the engine does not recognize, is ordinary chat and is
+// subject to the reply throttle.
+func isControlCommand(text string) bool {
+	return isCommand(text, "/scope") || isCommand(text, "/persona") || core.IsBuiltinCommand(text)
+}
+
+// isCommand reports whether text invokes the given command, either bare or
+// followed by a space-separated argument.
+func isCommand(text, command string) bool {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, command) {
+		return false
+	}
+	rest := text[len(command):]
+	return rest == "" || rest[0] == ' '
+}
+
+// rawTextOf extracts text segments only, without downloading attachments, so the
+// chat-scope gate can inspect a message cheaply.
+func rawTextOf(payload map[string]any) string {
+	var b strings.Builder
+	switch msg := payload["message"].(type) {
+	case []any:
+		for _, seg := range msg {
+			s, ok := seg.(map[string]any)
+			if !ok || s["type"] != "text" {
+				continue
+			}
+			if data, ok := s["data"].(map[string]any); ok {
+				if t, ok := data["text"].(string); ok {
+					b.WriteString(t)
+				}
+			}
+		}
+	default:
+		if raw, ok := payload["raw_message"].(string); ok {
+			b.WriteString(stripCQCodes(raw))
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// ── Chat scope persistence ──────────────────────
+
+type chatScopeState struct {
+	ChatScope string `json:"chat_scope"`
+}
+
+// chatScopeStatePath returns where the /scope override is stored, or "" when the
+// data dir and project name were not injected (e.g. in unit tests).
+func chatScopeStatePath(opts map[string]any) string {
+	dataDir := strings.TrimSpace(toString(opts["cc_data_dir"]))
+	project := strings.TrimSpace(toString(opts["cc_project"]))
+	if dataDir == "" || project == "" {
+		return ""
+	}
+	return filepath.Join(dataDir, "qq", sanitizePathPart(project), "chat_scope.json")
+}
+
+func loadChatScope(path string) string {
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("qq: read chat scope state failed", "path", path, "error", err)
+		}
+		return ""
+	}
+	var state chatScopeState
+	if err := json.Unmarshal(data, &state); err != nil {
+		slog.Warn("qq: parse chat scope state failed", "path", path, "error", err)
+		return ""
+	}
+	return parseChatScope(state.ChatScope)
+}
+
+func saveChatScope(path, scope string) error {
+	data, err := json.MarshalIndent(chatScopeState{ChatScope: scope}, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+// sanitizePathPart keeps letters, digits and a few punctuation marks so project
+// names (including non-ASCII ones) map to a safe single path segment.
+func sanitizePathPart(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case unicode.IsLetter(r), unicode.IsDigit(r), r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "default"
+	}
+	return b.String()
+}
+
+// ── Helpers ──
+
+type replyContext struct {
+	messageType string // "private" or "group"
+	userID      int64
+	groupID     int64
+	messageID   int32
+	persona     string // current persona tag for TTS
+	// triggerText is the current (unbuffered) message that caused this reply. It
+	// lets moderation refuse requests from non-operators.
+	triggerText string
+}
+
+func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
+	// qq:{userID}, qq:{groupID}:{userID} or qq:g:{groupID}
+	parts := strings.SplitN(sessionKey, ":", 3)
+	if len(parts) < 2 || parts[0] != "qq" {
+		return nil, fmt.Errorf("qq: invalid session key %q", sessionKey)
+	}
+	if len(parts) == 3 {
+		persona := p.personaFor(sessionKey)
+		if parts[1] == "g" {
+			gid, _ := strconv.ParseInt(parts[2], 10, 64)
+			return &replyContext{messageType: "group", groupID: gid, persona: persona}, nil
+		}
+		gid, _ := strconv.ParseInt(parts[1], 10, 64)
+		uid, _ := strconv.ParseInt(parts[2], 10, 64)
+		return &replyContext{messageType: "group", groupID: gid, userID: uid, persona: persona}, nil
+	}
+	uid, _ := strconv.ParseInt(parts[1], 10, 64)
+	return &replyContext{messageType: "private", userID: uid}, nil
+}
+
+// takePeerTurn admits one exchange with a bot peer, refusing when it answered too
+// recently (a tight loop rather than a conversation). The overall volume is bounded
+// by the game state instead of a round counter.
+func (p *Platform) takePeerTurn(groupID int64) bool {
+	p.peerMu.Lock()
+	defer p.peerMu.Unlock()
+
+	raw, _ := p.peerChains.LoadOrStore(groupID, &peerChain{})
+	chain := raw.(*peerChain)
+	now := time.Now()
+	if !chain.lastAt.IsZero() && now.Sub(chain.lastAt) < peerMinGap {
+		return false
+	}
+	chain.lastAt = now
+	return true
+}
+
+// setGame marks a game with peer as active in this group.
+func (p *Platform) setGame(groupID, peer int64) {
+	if groupID == 0 || peer == 0 {
+		return
+	}
+	p.gameMu.Lock()
+	defer p.gameMu.Unlock()
+	p.games.Store(groupID, &gameState{peer: peer, expiresAt: time.Now().Add(gameTTL)})
+}
+
+// clearGame ends any game in this group.
+func (p *Platform) clearGame(groupID int64) {
+	p.gameMu.Lock()
+	defer p.gameMu.Unlock()
+	p.games.Delete(groupID)
+}
+
+// gamePeer returns the peer of an active game and extends its lifetime, so an
+// ongoing game does not expire mid-way.
+func (p *Platform) gamePeer(groupID int64) (int64, bool) {
+	p.gameMu.Lock()
+	defer p.gameMu.Unlock()
+	raw, ok := p.games.Load(groupID)
+	if !ok {
+		return 0, false
+	}
+	g := raw.(*gameState)
+	if time.Now().After(g.expiresAt) {
+		p.games.Delete(groupID)
+		slog.Info("qq: game expired, ignoring bot traffic again", "group", groupID, "peer", g.peer)
+		return 0, false
+	}
+	g.expiresAt = time.Now().Add(gameTTL)
+	return g.peer, true
+}
+
+func (p *Platform) isAllowed(userID int64) bool {
+	if p.botPeers[userID] {
+		// A configured bot peer is admitted so a game with it can be played; its
+		// volume is bounded separately by the peer chain, not by allow_from.
+		return true
+	}
+	if p.allowFrom == "" || p.allowFrom == "*" {
+		return true
+	}
+	uid := strconv.FormatInt(userID, 10)
+	for _, allowed := range strings.Split(p.allowFrom, ",") {
+		if strings.TrimSpace(allowed) == uid {
+			return true
+		}
+	}
+	return false
+}
+
+// allowsSender decides whether a sender may talk to the bot. Besides allow_from,
+// an explicitly listed group is a trust boundary: the owner chose to put the bot
+// there, so any member may address it — requiring every member to be listed in
+// allow_from would make adding a group do nothing. Tool access for those members is
+// still bounded by tool_admin_only.
+func (p *Platform) allowsSender(msgType string, groupID, userID int64) bool {
+	if p.isAllowed(userID) {
+		return true
+	}
+	if msgType != "group" || groupID == 0 {
+		return false
+	}
+	return p.groupListedExplicitly(groupID)
+}
+
+// groupListedExplicitly reports whether groupID is named in group_allow. An empty
+// or "*" group_allow means "all groups" and deliberately does NOT imply that every
+// sender in every group is trusted.
+func (p *Platform) groupListedExplicitly(groupID int64) bool {
+	if p.groupAllow == "" || p.groupAllow == "*" {
+		return false
+	}
+	gid := strconv.FormatInt(groupID, 10)
+	for _, allowed := range strings.Split(p.groupAllow, ",") {
+		if strings.TrimSpace(allowed) == gid {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Platform) isGroupAllowed(groupID int64) bool {
+	if p.groupAllow == "" || p.groupAllow == "*" {
+		return true
+	}
+	gid := strconv.FormatInt(groupID, 10)
+	for _, allowed := range strings.Split(p.groupAllow, ",") {
+		if strings.TrimSpace(allowed) == gid {
+			return true
+		}
+	}
+	return false
+}
+
+// modeOverrideFor returns the per-message permission mode for a non-admin sender.
+// Group chats use the configured tool_non_admin_mode. Private non-admin messages
+// are dropped before this point (see handleMessage/handlePoke); the "plan" branch
+// is only a fallback, since the CLI auto-approves in-workspace edits and a live
+// mode switch alone cannot make a private session read-only.
+func (p *Platform) modeOverrideFor(msgType string, userID int64) string {
+	if !p.toolAdminOnly || p.isAdmin(userID) {
+		return ""
+	}
+	if msgType != "group" {
+		return "plan"
+	}
+	return p.toolNonAdminMode
+}
+
+func (p *Platform) isAdmin(userID int64) bool {
+	if p.adminIDs == "" {
+		return false
+	}
+	uid := strconv.FormatInt(userID, 10)
+	for _, id := range strings.Split(p.adminIDs, ",") {
+		if strings.TrimSpace(id) == uid {
+			return true
+		}
+	}
+	return false
+}
+
+// isBotMentioned checks if the message contains an @mention of the bot itself.
+func (p *Platform) isBotMentioned(payload map[string]any) bool {
+	selfIDStr := strconv.FormatInt(p.selfID, 10)
+	switch msg := payload["message"].(type) {
+	case []any:
+		for _, seg := range msg {
+			s, ok := seg.(map[string]any)
+			if !ok {
+				continue
+			}
+			if s["type"] == "at" {
+				if data, ok := s["data"].(map[string]any); ok {
+					if qq, ok := data["qq"].(string); ok {
+						if qq == selfIDStr {
+							return true
+						}
+					}
+				}
+			}
+		}
+	default:
+		if raw, ok := payload["raw_message"].(string); ok {
+			if strings.Contains(raw, "[CQ:at,qq="+selfIDStr+"]") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func toString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// optInt reads an integer option. TOML decodes integers as int64, while tests
+// and programmatic callers use int, so both must be accepted.
+func optInt(opts map[string]any, key string) int {
+	switch v := opts[key].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	}
+	return 0
+}
+
+// optIntOr reads an integer option, falling back to def only when the key is
+// absent, so an explicit 0 is preserved.
+func optIntOr(opts map[string]any, key string, def int) int {
+	if _, ok := opts[key]; !ok {
+		return def
+	}
+	return optInt(opts, key)
+}
+
+func toInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int64(n), true
+	case json.Number:
+		i, err := n.Int64()
+		return i, err == nil
+	case int64:
+		return n, true
+	}
+	return 0, false
+}
+
+func jsonInt64(m map[string]any, key string) int64 {
+	switch v := m[key].(type) {
+	case float64:
+		return int64(v)
+	case json.Number:
+		n, _ := v.Int64()
+		return n
+	}
+	return 0
+}
+
+func stripCQCodes(s string) string {
+	var result strings.Builder
+	for len(s) > 0 {
+		idx := strings.Index(s, "[CQ:")
+		if idx < 0 {
+			result.WriteString(s)
+			break
+		}
+		result.WriteString(s[:idx])
+		end := strings.Index(s[idx:], "]")
+		if end < 0 {
+			break
+		}
+		s = s[idx+end+1:]
+	}
+	return result.String()
+}
+
+func truncateText(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "..."
+}
+
+// markdownParts flattens a QQ markdown segment into readable text and returns the
+// image URLs embedded in it (`![\u56fe\u7247](url)` \u2014 bots put their generated images
+// inline). The payload is percent-encoded, links carry mqqapi:// targets that mean
+// nothing to the model, and QQ prefixes a JSON protocol header.
+func markdownParts(content string) (string, []string) {
+	if unescaped, err := url.PathUnescape(content); err == nil {
+		content = unescaped
+	}
+	var images []string
+	content = markdownImage.ReplaceAllStringFunc(content, func(m string) string {
+		if sub := markdownImage.FindStringSubmatch(m); len(sub) == 3 {
+			images = append(images, sub[2])
+		}
+		return ""
+	})
+	// [label](target) -> label; this also eats the `[]({...})` protocol header.
+	content = markdownLink.ReplaceAllString(content, "$1")
+	content = strings.NewReplacer("**", "", "`", "", "\u200b", "").Replace(content)
+	return strings.TrimSpace(content), images
+}
+
+var (
+	markdownLink  = regexp.MustCompile(`\[([^\]]*)\]\([^)]*\)`)
+	markdownImage = regexp.MustCompile(`!\[([^\]]*)\]\(([^)]+)\)`)
+)
+
+// echoesMarkdown reports whether a plain text segment just repeats the body of a
+// markdown segment from the same message. QQ bot replies carry both — the markdown
+// element (mention + inline image) plus a plain text copy — so without this the
+// model would see every line twice.
+func echoesMarkdown(mdTexts []string, text string) bool {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return true
+	}
+	for _, md := range mdTexts {
+		if md == t || strings.HasSuffix(md, t) {
+			return true
+		}
+	}
+	return false
+}
+
+func downloadFile(url string) ([]byte, string, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", err
+	}
+
+	mime := resp.Header.Get("Content-Type")
+	if mime == "" {
+		mime = http.DetectContentType(data)
+	}
+	return data, mime, nil
+}
+
+// fetchImage obtains an image segment's bytes.
+//
+// The url in a message event carries a QQ CDN rkey that can already be stale by
+// the time the event arrives — fetching it returns HTTP 400, which is why images
+// used to arrive as a 70-byte {"retcode":-5503007,"retmsg":"download url has
+// expired"} payload. The url is therefore rebuilt with a current rkey first, and
+// the event url is only a fallback.
+func (p *Platform) fetchImage(data map[string]any, chatKind string) (core.ImageAttachment, bool) {
+	file, _ := data["file"].(string)
+	eventURL, _ := data["url"].(string)
+	slog.Debug("qq: image segment", "file", file, "url_len", len(eventURL))
+
+	if rebuilt := p.withFreshRKey(eventURL, chatKind); rebuilt != "" && rebuilt != eventURL {
+		if img, ok := downloadImage(rebuilt); ok {
+			return img, true
+		}
+	}
+	if eventURL != "" {
+		if img, ok := downloadImage(eventURL); ok {
+			return img, true
+		}
+	}
+	return core.ImageAttachment{}, false
+}
+
+// withFreshRKey rebuilds a QQ CDN download url using a currently valid rkey from
+// get_rkey. Returns "" when the url is not a CDN link or no rkey is available.
+func (p *Platform) withFreshRKey(rawURL, chatKind string) string {
+	if rawURL == "" {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	q := u.Query()
+	if q.Get("fileid") == "" {
+		return ""
+	}
+	rkey := p.cdnRKey(chatKind)
+	if rkey == "" {
+		return ""
+	}
+	q.Set("rkey", rkey)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// cdnRKey returns a cached rkey for the given chat kind, refreshing it from
+// get_rkey when it is missing or close to expiry.
+func (p *Platform) cdnRKey(kind string) string {
+	p.rkeyMu.Lock()
+	defer p.rkeyMu.Unlock()
+
+	if p.rkeyMap == nil {
+		p.rkeyMap = map[string]rkeyEntry{}
+	}
+	if e, ok := p.rkeyMap[kind]; ok && e.value != "" && time.Since(e.fetchedAt) < rkeyRefreshInterval {
+		return e.value
+	}
+
+	raw, err := p.callAPIRaw("get_rkey", nil)
+	if err != nil {
+		slog.Warn("qq: get_rkey failed", "error", err)
+		return p.rkeyMap[kind].value
+	}
+	var list []struct {
+		Type string `json:"type"`
+		RKey string `json:"rkey"`
+	}
+	if err := json.Unmarshal(raw, &list); err != nil {
+		slog.Warn("qq: get_rkey: unexpected response", "error", err)
+		return p.rkeyMap[kind].value
+	}
+	now := time.Now()
+	for _, e := range list {
+		if e.Type == "" || e.RKey == "" {
+			continue
+		}
+		// NapCat hands the value back with the query prefix already attached.
+		p.rkeyMap[e.Type] = rkeyEntry{value: strings.TrimPrefix(e.RKey, "&rkey="), fetchedAt: now}
+	}
+	slog.Debug("qq: refreshed CDN rkeys", "kinds", len(list))
+	return p.rkeyMap[kind].value
+}
+
+func downloadImage(url string) (core.ImageAttachment, bool) {
+	data, _, err := downloadFile(url)
+	if err != nil {
+		slog.Warn("qq: image download failed", "error", err)
+		return core.ImageAttachment{}, false
+	}
+	return validateImage(data)
+}
+
+// validateImage rejects anything that is not really an image. QQ serves its
+// errors with HTTP 200 and a JSON body such as
+// {"retcode":-5503007,"retmsg":"download url has expired"}, which would otherwise
+// be handed to the agent as a picture of an error message.
+func validateImage(data []byte) (core.ImageAttachment, bool) {
+	if len(data) == 0 {
+		return core.ImageAttachment{}, false
+	}
+	// Sniff the bytes rather than trusting Content-Type: the error payload may
+	// even be labelled image/png.
+	mime := http.DetectContentType(data)
+	if !strings.HasPrefix(mime, "image/") {
+		slog.Warn("qq: image download returned non-image content",
+			"detected", mime, "bytes", len(data), "body", truncateText(string(data), 120))
+		return core.ImageAttachment{}, false
+	}
+	return core.ImageAttachment{MimeType: mime, Data: data}, true
+}
+
+// chatKind reports whether a payload came from a group, for choosing which CDN
+// rkey applies.
+func chatKind(payload map[string]any) string {
+	if t, _ := payload["message_type"].(string); t == "group" {
+		return "group"
+	}
+	return "private"
+}

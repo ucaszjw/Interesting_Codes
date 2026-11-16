@@ -1,0 +1,63 @@
+# botd — QQ chat harness (NapCat OneBot + DeepSeek)
+
+[qq]
+ws_url = "ws://127.0.0.1:3001"
+token = ""
+allow_from = "2232095290"
+admin_ids = "2232095290"
+group_allow = "341353242"
+require_at = false
+share_session_in_channel = true
+bot_peers = ""
+moderation_groups = ""
+moderation_mute_max_minutes = 10
+voice_probability = 10
+reply_cooldown = 60
+reply_probability = 10
+reply_prob_min = 10
+reply_prob_max = 15
+reply_cold_boost = 1
+reply_skip_penalty = 3
+reply_with_quote = true
+emoji_like = true
+check_mute = true
+
+[llm]
+base_url = "https://api.deepseek.com/v1"
+api_key = "sk-..."
+model = "deepseek-v4-flash"
+timeout_s = 120
+
+[tts]
+enabled = true
+voice = "stella"        # "stella" | "tide"
+probability = 10        # % of group replies spoken; 0 = text only, 100 = always
+max_chars = 300         # skip TTS for longer replies; 0 = no limit
+base_url = ""           # default: llm.base_url + /tools/tts
+api_key = ""            # default: llm.api_key
+
+[stickers]
+enabled = true
+dir = "./data/stickers"   # memes seen in group chats are saved here
+max = 300                 # oldest files are evicted beyond this
+
+[chat]
+persona = "大肥鱼"
+prompts_dir = "./prompts"
+sessions_dir = "./data/sessions"
+history_max_tokens = 16000
+keep_recent_messages = 24
+summary_max_chars = 500
+
+# Scheduled jobs. "prompt" goes through the model; "message" is sent literally
+# (with an optional @). Both can target a different persona.
+[[cron]]
+cron = "0 8 * * *"
+prompt = "早上好，发一条早安整活消息"
+group_id = 341353242
+
+[[cron]]
+cron = "0 8 * * *"
+message = "/签到"
+at = 3889045760
+group_id = 341353242
