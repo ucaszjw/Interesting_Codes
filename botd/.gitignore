@@ -1,5 +1,5 @@
 config.toml
 data/
 logs/
-botd
+/botd
 .botd.new

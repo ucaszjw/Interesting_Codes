@@ -11,6 +11,11 @@ share_session_in_channel = true
 bot_peers = ""
 moderation_groups = ""
 moderation_mute_max_minutes = 10
+# dictator_mode: when true and the bot owns the group, drop every rank exemption:
+# the operator can be muted/demoted and nobody's commands are obeyed — only the
+# bot's own judgment matters.
+# 独裁模式：bot 为群主时取消所有豁免——张氏也能被禁言/撤销管理，任何人的指令都不服从。
+dictator_mode = false
 voice_probability = 10
 reply_cooldown = 60
 reply_probability = 10

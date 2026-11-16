@@ -148,6 +148,11 @@ type Platform struct {
 	// APIs. Opt-in because these actions hit real people.
 	moderationGroups map[int64]bool
 	muteMaxMinutes   int
+	// dictatorMode removes every rank exemption while the bot owns a group: the
+	// operator can be muted/demoted and nobody's commands carry authority. It is
+	// toggled by /dict and persisted.
+	dictatorMode      atomic.Bool
+	dictatorStatePath string
 
 	// botGroupRoles caches the bot's own role per group so every message can carry
 	// the right [群管] hint without an API call each time.
@@ -365,6 +370,7 @@ func New(opts map[string]any) (core.Platform, error) {
 	if muteMaxMinutes <= 0 {
 		muteMaxMinutes = 10
 	}
+	dictatorMode, _ := opts["dictator_mode"].(bool)
 
 	emojiLikeDef, _ := opts["emoji_like_id"].(string)
 
@@ -416,7 +422,7 @@ func New(opts map[string]any) (core.Platform, error) {
 	}
 
 	core.CheckAllowFrom("qq", allowFrom)
-	return &Platform{
+	p := &Platform{
 		wsURL:                 wsURL,
 		token:                 token,
 		allowFrom:             allowFrom,
@@ -447,11 +453,18 @@ func New(opts map[string]any) (core.Platform, error) {
 		seenNames:             map[int64]string{},
 		moderationGroups:      moderationGroups,
 		muteMaxMinutes:        muteMaxMinutes,
+		dictatorStatePath:     dictatorStatePath(opts),
 		botGroupRoles:         map[int64]groupRoleEntry{},
 		emojiLikeDef:          emojiLikeDef,
 		cronJobs:              cronJobs,
 		recentMessages:        make(map[int64]*recallEntry),
-	}, nil
+	}
+	// A persisted /dict value wins over the config default.
+	if saved, ok := loadDictatorMode(p.dictatorStatePath); ok {
+		dictatorMode = saved
+	}
+	p.dictatorMode.Store(dictatorMode)
+	return p, nil
 }
 
 func (p *Platform) Name() string { return "qq" }
@@ -711,13 +724,19 @@ func (p *Platform) handleMessage(payload map[string]any) {
 		userID:      userID,
 		groupID:     groupID,
 		messageID:   int32(messageID),
-		triggerText: text,
 	}
 
 	// Handle /scope (admin-only) before anything group-specific so switching back
 	// from "only private" is possible from a group and vice versa.
 	if isCommand(text, "/scope") {
 		p.handleScopeCommand(rctx, userID, text)
+		return
+	}
+
+	// /dict toggles dictator mode; only the operator may switch it, in both
+	// directions (otherwise it could never be turned off again).
+	if isCommand(text, "/dict") {
+		p.handleDictCommand(rctx, userID, text)
 		return
 	}
 
@@ -1449,18 +1468,9 @@ func parseModerationMarkers(content string) (string, []moderationAction) {
 
 // applyModeration executes model-requested actions and returns short failure notes
 // for the reply. It is a no-op outside opted-in groups.
-// moderationRequestRE spots a member asking for a moderation power. The bot may
-// still act on its own observation, but not on a non-operator's command.
-var moderationRequestRE = regexp.MustCompile(`(禁言|解禁|撤回|撤销管理|取消管理|设置管理|设为管理|撤管理|踢出|踢了)`)
-
 func (p *Platform) applyModeration(rctx *replyContext, actions []moderationAction) []string {
 	if len(actions) == 0 || rctx.messageType != "group" || !p.moderationGroups[rctx.groupID] {
 		return nil
-	}
-	// Only the operator and the bot's own judgment may trigger moderation. A
-	// non-admin's explicit request must not turn into a mute/unmute/recall.
-	if !p.isAdmin(rctx.userID) && moderationRequestRE.MatchString(rctx.triggerText) {
-		return []string{"权限指令只认张氏"}
 	}
 	var notes []string
 	for _, a := range actions {
@@ -1491,9 +1501,11 @@ func (p *Platform) moderateAdmin(rctx *replyContext, a moderationAction) error {
 	if !p.botIsGroupOwner(groupID) {
 		return fmt.Errorf("只有群主能调整群管理")
 	}
-	// Appointing an admin requires the operator's explicit request; revoking one
-	// may be the bot's own judgment after observing abuse.
-	if a.kind == "setadmin" && !p.isAdmin(rctx.userID) {
+	// Appointing an admin normally requires the operator's explicit request;
+	// revoking one may be the bot's own judgment. Dictator mode allows both
+	// without anyone's permission, and removes the operator's exemption.
+	dictator := p.dictatorMode.Load()
+	if a.kind == "setadmin" && !dictator && !p.isAdmin(rctx.userID) {
 		return fmt.Errorf("只有张氏能设立群管理")
 	}
 	if a.target == 0 || a.target == p.selfID {
@@ -1506,7 +1518,7 @@ func (p *Platform) moderateAdmin(rctx *replyContext, a moderationAction) error {
 	if role == "owner" {
 		return fmt.Errorf("不能调整群主")
 	}
-	if a.kind == "unsetadmin" && p.isAdmin(a.target) {
+	if a.kind == "unsetadmin" && !dictator && p.isAdmin(a.target) {
 		return fmt.Errorf("不能取消操作者的管理")
 	}
 	enable := a.kind == "setadmin"
@@ -1530,14 +1542,13 @@ func (p *Platform) moderateMute(rctx *replyContext, a moderationAction) error {
 	if a.target == 0 || a.target == p.selfID {
 		return fmt.Errorf("目标无效")
 	}
-	// The operator is never muted, even when the bot owns the group — otherwise a
-	// misfire could lock its own admin out with no way to ask for an unmute.
-	if a.kind == "mute" && p.isAdmin(a.target) {
-		return fmt.Errorf("无法禁言")
-	}
 	// A group owner outranks everyone, so the rank checks only apply when the bot
 	// is merely an admin.
 	botIsOwner := p.botIsGroupOwner(groupID)
+	// The operator is normally never muted; dictator mode removes that exemption.
+	if a.kind == "mute" && !(p.dictatorMode.Load() && botIsOwner) && p.isAdmin(a.target) {
+		return fmt.Errorf("无法禁言")
+	}
 	// Membership is the hard check: it rejects invented QQ numbers, and it tells us
 	// whether the target outranks the bot.
 	role, err := p.groupMemberRole(groupID, a.target)
@@ -2123,6 +2134,9 @@ func (p *Platform) RoleHint(sessionKey string) string {
 	}
 	switch p.botGroupRole(gid) {
 	case "owner":
+		if p.dictatorMode.Load() {
+			return "[群管:独裁]"
+		}
 		return "[群管:群主]"
 	case "admin":
 		return "[群管:管理员]"
@@ -2704,6 +2718,48 @@ func (p *Platform) scopeBlocks(msgType, text string) bool {
 }
 
 // handleScopeCommand implements the admin-only /scope command.
+func (p *Platform) handleDictCommand(rctx *replyContext, userID int64, text string) {
+	reply := func(msg string) {
+		if err := p.Reply(context.Background(), rctx, msg); err != nil {
+			slog.Warn("qq: reply to /dict failed", "error", err)
+		}
+	}
+	if !p.isAdmin(userID) {
+		reply("只有张氏能切换独裁模式。")
+		return
+	}
+	fields := strings.Fields(text)
+	arg := ""
+	if len(fields) > 1 {
+		arg = strings.ToLower(fields[1])
+	}
+	switch arg {
+	case "on", "true", "1", "开", "开启":
+		p.setDictatorMode(true)
+		reply("独裁模式已开启：群主是 bot 时，张氏也不再享有豁免，任何人的权限指令都不服从。")
+	case "off", "false", "0", "关", "关闭":
+		p.setDictatorMode(false)
+		reply("独裁模式已关闭。")
+	case "", "status", "状态":
+		state := "关闭"
+		if p.dictatorMode.Load() {
+			state = "开启"
+		}
+		reply("独裁模式当前：" + state + "。用法：/dict on|off")
+	default:
+		reply("用法：/dict on|off")
+	}
+}
+
+// setDictatorMode updates the flag and persists it so a restart keeps it.
+func (p *Platform) setDictatorMode(enabled bool) {
+	p.dictatorMode.Store(enabled)
+	if err := saveDictatorMode(p.dictatorStatePath, enabled); err != nil {
+		slog.Warn("qq: save dictator mode failed", "error", err)
+	}
+	slog.Info("qq: dictator mode changed", "enabled", enabled)
+}
+
 func (p *Platform) handleScopeCommand(rctx *replyContext, userID int64, text string) {
 	reply := func(msg string) {
 		if err := p.Reply(context.Background(), rctx, msg); err != nil {
@@ -2852,6 +2908,48 @@ func saveChatScope(path, scope string) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
+// dictatorStatePath stores the /dict toggle next to the chat-scope state.
+func dictatorStatePath(opts map[string]any) string {
+	dataDir := strings.TrimSpace(toString(opts["cc_data_dir"]))
+	project := strings.TrimSpace(toString(opts["cc_project"]))
+	if dataDir == "" || project == "" {
+		return ""
+	}
+	return filepath.Join(dataDir, "qq", sanitizePathPart(project), "dictator.json")
+}
+
+func loadDictatorMode(path string) (bool, bool) {
+	if path == "" {
+		return false, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, false
+	}
+	var st struct {
+		Enabled bool `json:"enabled"`
+	}
+	if json.Unmarshal(data, &st) != nil {
+		return false, false
+	}
+	return st.Enabled, true
+}
+
+func saveDictatorMode(path string, enabled bool) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, _ := json.Marshal(map[string]bool{"enabled": enabled})
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 // sanitizePathPart keeps letters, digits and a few punctuation marks so project
 // names (including non-ASCII ones) map to a safe single path segment.
 func sanitizePathPart(s string) string {
@@ -2878,9 +2976,6 @@ type replyContext struct {
 	groupID     int64
 	messageID   int32
 	persona     string // current persona tag for TTS
-	// triggerText is the current (unbuffered) message that caused this reply. It
-	// lets moderation refuse requests from non-operators.
-	triggerText string
 }
 
 func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {

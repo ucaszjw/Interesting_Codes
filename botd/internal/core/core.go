@@ -177,7 +177,7 @@ func ConvertAudioToMP3(ctx context.Context, audio []byte, srcFormat string) ([]b
 var builtinCommands = [][]string{
 	{"new"}, {"reset"}, {"persona"}, {"scope"}, {"game"}, {"bots"},
 	{"mute"}, {"unmute"}, {"help"}, {"status"}, {"list", "sessions"},
-	{"switch"}, {"name", "rename"}, {"facts"}, {"remember"}, {"forget"},
+	{"switch"}, {"name", "rename"}, {"facts"}, {"remember"}, {"forget"}, {"dict"},
 	{"sticker", "stickers"}, {"tts"}, {"compress", "compact"},
 }
 

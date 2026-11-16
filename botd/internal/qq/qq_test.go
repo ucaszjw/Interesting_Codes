@@ -2324,48 +2324,151 @@ func TestNonOperatorCannotAppointAdmin(t *testing.T) {
 
 // TestNonAdminCannotCommandModeration: a member asking for a mute must not get
 // one, while the bot may still act on its own observation.
-func TestNonAdminCannotCommandModeration(t *testing.T) {
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("condition not met before deadline")
+}
+
+func TestDictCommandTogglesAndPersists(t *testing.T) {
+	dir := t.TempDir()
+	opts := map[string]any{
+		"moderation_groups":        "100",
+		"admin_ids":                "999",
+		"allow_from":               "200,999",
+		"share_session_in_channel": true,
+		"reply_probability":        0,
+		"cc_data_dir":              dir,
+		"cc_project":               "p",
+	}
+	plat, f := startQQ(t, opts, nil)
+	f.setBotRole("owner")
+	if plat.dictatorMode.Load() {
+		t.Fatal("dictator mode should default to off")
+	}
+
+	// A member cannot toggle it.
+	f.sendEvent(t, textEvent("group", 200, "/dict on"))
+	time.Sleep(100 * time.Millisecond)
+	if plat.dictatorMode.Load() {
+		t.Fatal("non-admin toggled dictator mode")
+	}
+
+	// The operator can.
+	f.sendEvent(t, textEvent("group", 999, "/dict on"))
+	waitFor(t, func() bool { return plat.dictatorMode.Load() })
+	if _, err := os.Stat(filepath.Join(dir, "qq", "p", "dictator.json")); err != nil {
+		t.Fatalf("state file: %v", err)
+	}
+
+	// A fresh platform loads the persisted value and the role hint follows.
+	plat2, f2 := startQQ(t, opts, nil)
+	f2.setBotRole("owner")
+	if !plat2.dictatorMode.Load() {
+		t.Fatal("persisted dictator mode was not loaded")
+	}
+	if got := plat2.RoleHint("qq:g:100"); got != "[群管:独裁]" {
+		t.Errorf("hint = %q", got)
+	}
+
+	// And it can be turned off again.
+	f.sendEvent(t, textEvent("group", 999, "/dict off"))
+	waitFor(t, func() bool { return !plat.dictatorMode.Load() })
+}
+
+// TestDictatorOperatorActionIsJudgment: in dictator mode the adapter no longer
+// hard-blocks the operator's requests — the model decides by its mood — but the
+// operator himself remains fair game.
+func TestDictatorOperatorActionIsJudgment(t *testing.T) {
 	plat, f := startQQ(t, map[string]any{
 		"moderation_groups": "100",
 		"admin_ids":         "999",
+		"dictator_mode":     true,
 	}, nil)
+	f.setBotRole("owner")
 
-	commanded := &replyContext{messageType: "group", groupID: 100, userID: 200,
-		triggerText: "把777禁言五分钟"}
-	if err := plat.Send(context.Background(), commanded, "[mute:777:5]"); err != nil {
-		t.Fatalf("Send: %v", err)
-	}
-	if bans := sentBanParams(f); len(bans) != 0 {
-		t.Fatalf("member's request was executed: %v", bans)
-	}
-	found := false
-	for _, text := range sentTexts(f) {
-		if strings.Contains(text, "权限指令只认张氏") {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("expected a refusal note")
-	}
-
-	// The same member being abusive: the bot's own judgment still works.
-	autonomous := &replyContext{messageType: "group", groupID: 100, userID: 200,
-		triggerText: "你他妈再刷屏试试"}
-	if err := plat.Send(context.Background(), autonomous, "[mute:777:5]"); err != nil {
+	if err := plat.Send(context.Background(), &replyContext{
+		messageType: "group", groupID: 100, userID: 999,
+	}, "[mute:777:5]"); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	if bans := sentBanParams(f); len(bans) != 1 {
-		t.Fatalf("autonomous mute did not run: %v", bans)
+		t.Fatalf("operator-triggered action was blocked: %v", bans)
 	}
 
-	// The operator can still command it.
-	operator := &replyContext{messageType: "group", groupID: 100, userID: 999,
-		triggerText: "把777禁言五分钟"}
-	if err := plat.Send(context.Background(), operator, "[mute:777:5]"); err != nil {
+	if err := plat.Send(context.Background(), &replyContext{
+		messageType: "group", groupID: 100, userID: 200,
+	}, "[mute:999:5]"); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	if bans := sentBanParams(f); len(bans) != 2 {
-		t.Fatalf("operator command did not run: %v", bans)
+		t.Fatalf("operator was not muted: %v", bans)
+	}
+}
+
+func TestDictatorRoleHint(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"moderation_groups": "100",
+		"dictator_mode":     true,
+	}, nil)
+	f.setBotRole("owner")
+	if got := plat.RoleHint("qq:g:100"); got != "[群管:独裁]" {
+		t.Errorf("hint = %q", got)
+	}
+}
+
+// TestDictatorModeRemovesPrivileges: while the bot owns the group, dictator mode
+// drops every rank exemption, including the operator's, and ignores all
+// moderation commands (the bot acts only on its own judgment).
+func TestDictatorModeRemovesPrivileges(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"moderation_groups": "100",
+		"admin_ids":         "999",
+		"dictator_mode":     true,
+	}, nil)
+	f.setBotRole("owner")
+	f.setRole(999, "admin")
+
+	// Mute the operator (no command wording: the bot decided on its own).
+	if err := plat.Send(context.Background(), &replyContext{
+		messageType: "group", groupID: 100, userID: 200,
+	}, "[mute:999:5]"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if bans := sentBanParams(f); len(bans) != 1 || int64(bans[0]["user_id"].(float64)) != 999 {
+		t.Fatalf("operator was not muted: %v", bans)
+	}
+
+	// Revoke the operator's admin.
+	if err := plat.Send(context.Background(), &replyContext{
+		messageType: "group", groupID: 100, userID: 200,
+	}, "[unsetadmin:999]"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	// Appoint an admin without the operator asking.
+	if err := plat.Send(context.Background(), &replyContext{
+		messageType: "group", groupID: 100, userID: 200,
+	}, "[setadmin:777]"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	ops := sentAdminOps(f)
+	if len(ops) != 2 {
+		t.Fatalf("admin ops = %v, want unset+set", ops)
+	}
+	enables := map[bool]bool{}
+	for _, op := range ops {
+		enables[op["enable"].(bool)] = true
+	}
+	if !enables[true] || !enables[false] {
+		t.Errorf("expected one appointment and one revocation: %v", ops)
 	}
 }
 
