@@ -77,24 +77,25 @@ func extFor(mime string) string {
 	}
 }
 
-// Add stores one sticker. It reports false when the same image is already known.
-func (s *Store) Add(mime string, data []byte, label string) (bool, error) {
+// Add stores one sticker and returns its id. added is false when the same image
+// is already known.
+func (s *Store) Add(mime string, data []byte, label string) (id string, added bool, err error) {
 	if len(data) == 0 {
-		return false, nil
+		return "", false, nil
 	}
 	sum := sha256.Sum256(data)
-	id := hex.EncodeToString(sum[:12])
+	id = hex.EncodeToString(sum[:12])
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, e := range s.entries {
 		if e.ID == id {
-			return false, nil
+			return id, false, nil
 		}
 	}
 	file := id + extFor(mime)
 	if err := os.WriteFile(filepath.Join(s.Dir, file), data, 0o644); err != nil {
-		return false, fmt.Errorf("stickers: write: %w", err)
+		return id, false, fmt.Errorf("stickers: write: %w", err)
 	}
 	s.entries = append(s.entries, Entry{
 		ID: id, File: file, Mime: mime, Size: int64(len(data)),
@@ -106,9 +107,52 @@ func (s *Store) Add(mime string, data []byte, label string) (bool, error) {
 		_ = os.Remove(filepath.Join(s.Dir, old.File))
 	}
 	if err := s.saveIndex(); err != nil {
-		return false, err
+		return id, false, err
 	}
-	return true, nil
+	return id, true, nil
+}
+
+// SetLabel replaces an entry's label (used by automatic vision tagging).
+func (s *Store) SetLabel(id, label string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.entries {
+		if s.entries[i].ID == id {
+			s.entries[i].Label = label
+			_ = s.saveIndex()
+			return true
+		}
+	}
+	return false
+}
+
+// Entries returns a snapshot of the library.
+func (s *Store) Entries() []Entry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Entry(nil), s.entries...)
+}
+
+// Read loads the file for id.
+func (s *Store) Read(id string) (Entry, []byte, bool) {
+	s.mu.Lock()
+	var file string
+	var hit Entry
+	for _, e := range s.entries {
+		if e.ID == id {
+			file, hit = e.File, e
+			break
+		}
+	}
+	s.mu.Unlock()
+	if file == "" {
+		return Entry{}, nil, false
+	}
+	data, err := os.ReadFile(filepath.Join(s.Dir, file))
+	if err != nil {
+		return Entry{}, nil, false
+	}
+	return hit, data, true
 }
 
 // Count returns the library size.

@@ -53,6 +53,44 @@ func TestChatRequestAndUsage(t *testing.T) {
 	}
 }
 
+func TestDescribeImageSanitizesLabel(t *testing.T) {
+	var gotSys string
+	var gotParts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req wireRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		gotSys = req.Messages[0].Content.(string)
+		gotParts = len(req.Messages[1].Content.([]any))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"「狗头大笑！」\n"}}]}`))
+	}))
+	defer srv.Close()
+
+	c := New(Config{BaseURL: srv.URL, APIKey: "key", Model: "m"})
+	label, err := c.DescribeImage(context.Background(), "image/gif", []byte("gif"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if label != "狗头大笑" {
+		t.Errorf("label = %q", label)
+	}
+	if !strings.Contains(gotSys, "表情包标注") {
+		t.Errorf("system prompt = %q", gotSys)
+	}
+	if gotParts != 2 {
+		t.Errorf("content parts = %d, want text+image", gotParts)
+	}
+}
+
+func TestSanitizeLabelCapsLength(t *testing.T) {
+	got := sanitizeLabel(strings.Repeat("鱼", 40))
+	if n := len([]rune(got)); n != 20 {
+		t.Errorf("rune len = %d, want 20", n)
+	}
+	if got := sanitizeLabel("  猫，咪。流泪  "); got != "猫咪流泪" {
+		t.Errorf("sanitize = %q", got)
+	}
+}
+
 func TestChatAPIError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -131,5 +169,29 @@ func TestChatWithToolsParsesToolCalls(t *testing.T) {
 	}
 	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Name != "web_search" || resp.ToolCalls[0].ID != "c1" {
 		t.Fatalf("tool calls = %+v", resp.ToolCalls)
+	}
+}
+
+func TestVerifyImage(t *testing.T) {
+	for _, tc := range []struct {
+		reply string
+		match bool
+		desc  string
+	}{
+		{`{"choices":[{"message":{"content":"{\"match\":true,\"desc\":\"校园航拍\"}"}}]}`, true, "校园航拍"},
+		{"{\"choices\":[{\"message\":{\"content\":\"```json\\n{\\\"match\\\":false,\\\"desc\\\":\\\"一只猫\\\"}\\n```\"}}]}", false, "一只猫"},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(tc.reply))
+		}))
+		c := New(Config{BaseURL: srv.URL, APIKey: "k"})
+		match, desc, err := c.VerifyImage(context.Background(), "image/jpeg", []byte("img"), "国科大校园")
+		srv.Close()
+		if err != nil {
+			t.Fatalf("reply %s: %v", tc.reply, err)
+		}
+		if match != tc.match || desc != tc.desc {
+			t.Errorf("reply %s => %v,%q", tc.reply, match, desc)
+		}
 	}
 }

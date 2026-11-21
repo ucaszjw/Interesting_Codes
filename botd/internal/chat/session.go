@@ -69,7 +69,7 @@ func hashKey(key string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (s *Store) chatDir(key string) string { return filepath.Join(s.Dir, hashKey(key)) }
+func (s *Store) chatDir(key string) string   { return filepath.Join(s.Dir, hashKey(key)) }
 func (s *Store) indexPath(key string) string { return filepath.Join(s.chatDir(key), "index.json") }
 func (s *Store) sessionPath(key, id string) string {
 	return filepath.Join(s.chatDir(key), id+".json")

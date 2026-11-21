@@ -2099,6 +2099,26 @@ func TestGroupOwnerCannotMuteOperator(t *testing.T) {
 	}
 }
 
+// TestDarkModeMutesOperator: dark mode's "no profanity, no voice" rule has no
+// exemption, so even the configured operator can be muted.
+func TestDarkModeMutesOperator(t *testing.T) {
+	plat, f := startQQ(t, map[string]any{
+		"moderation_groups": "100",
+		"admin_ids":         "999",
+		"dark_mode":         true,
+	}, nil)
+	f.setBotRole("owner")
+
+	if err := plat.Send(context.Background(), &replyContext{
+		messageType: "group", groupID: 100, userID: 999, messageID: 1,
+	}, "[mute:999:1] 不说脏话就得挨禁言"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if bans := sentBanParams(f); len(bans) != 1 || int64(bans[0]["user_id"].(float64)) != 999 {
+		t.Fatalf("operator was not muted in dark mode: %v", bans)
+	}
+}
+
 // TestAdminRequestCanMuteInactiveMember: the owner names someone who has not
 // spoken since the bot restarted; requiring a recent message made the mute fail.
 func TestAdminRequestCanMuteInactiveMember(t *testing.T) {
@@ -3040,4 +3060,53 @@ func TestIsAllowedIncludesBotPeers(t *testing.T) {
 	if p.isAllowed(222) {
 		t.Error("an unlisted user must not be admitted")
 	}
+}
+
+func TestDarkCommandTogglesAndPersists(t *testing.T) {
+	dir := t.TempDir()
+	opts := map[string]any{
+		"moderation_groups":        "100",
+		"admin_ids":                "999",
+		"allow_from":               "200,999",
+		"share_session_in_channel": true,
+		"reply_probability":        0,
+		"cc_data_dir":              dir,
+		"cc_project":               "p",
+	}
+	plat, f := startQQ(t, opts, nil)
+	f.setBotRole("admin")
+	if plat.darkMode.Load() {
+		t.Fatal("dark mode should default to off")
+	}
+
+	f.sendEvent(t, textEvent("group", 200, "/dark on"))
+	time.Sleep(100 * time.Millisecond)
+	if plat.darkMode.Load() {
+		t.Fatal("non-admin toggled dark mode")
+	}
+
+	f.sendEvent(t, textEvent("group", 999, "/dark on"))
+	waitFor(t, func() bool { return plat.darkMode.Load() })
+	if _, err := os.Stat(filepath.Join(dir, "qq", "p", "dark.json")); err != nil {
+		t.Fatalf("state file: %v", err)
+	}
+	if got := plat.RoleHint("qq:g:100"); got != "[群管:管理员][群管:黑暗]" {
+		t.Errorf("hint = %q", got)
+	}
+	// The switch queues exactly one fresh conversation for the group.
+	if !plat.ConsumeModeReset("qq:g:100") {
+		t.Error("mode switch did not queue a session reset")
+	}
+	if plat.ConsumeModeReset("qq:g:100") {
+		t.Error("session reset was consumed twice")
+	}
+
+	plat2, f2 := startQQ(t, opts, nil)
+	f2.setBotRole("admin")
+	if !plat2.darkMode.Load() {
+		t.Fatal("persisted dark mode was not loaded")
+	}
+
+	f.sendEvent(t, textEvent("group", 999, "/dark off"))
+	waitFor(t, func() bool { return !plat.darkMode.Load() })
 }

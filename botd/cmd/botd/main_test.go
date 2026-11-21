@@ -1,13 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -20,13 +27,14 @@ import (
 )
 
 type fakePlatform struct {
-	mu       sync.Mutex
-	sent     []string
-	audio    []byte
-	format   string
-	imgMime  string
-	imgData  []byte
-	roleHint string
+	mu        sync.Mutex
+	sent      []string
+	audio     []byte
+	format    string
+	imgMime   string
+	imgData   []byte
+	roleHint  string
+	modeReset bool
 }
 
 func (f *fakePlatform) Name() string                    { return "fake" }
@@ -57,6 +65,16 @@ func (f *fakePlatform) SendImage(_ context.Context, _ any, img core.ImageAttachm
 func (f *fakePlatform) RoleHint(string) string                  { return f.roleHint }
 func (f *fakePlatform) ReconstructReplyCtx(string) (any, error) { return "ctx", nil }
 func (f *fakePlatform) Stop() error                             { return nil }
+
+func (f *fakePlatform) ConsumeModeReset(string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.modeReset {
+		return false
+	}
+	f.modeReset = false
+	return true
+}
 
 func (f *fakePlatform) messages() []string {
 	f.mu.Lock()
@@ -97,7 +115,8 @@ func newTestBot(t *testing.T, llmHandler http.HandlerFunc) (*bot, *fakePlatform)
 	t.Cleanup(srv.Close)
 	client := llm.New(llm.Config{BaseURL: srv.URL, APIKey: "k", Model: "m"})
 
-	b := &bot{cfg: Config{}, prompts: prompts, store: store, client: client, mood: newMoodTracker(""), tools: toolDefs}
+	b := &bot{cfg: Config{}, prompts: prompts, store: store, client: client,
+		images: media.NewImageFetcher(true), mood: newMoodTracker(""), tools: toolDefs}
 	b.cfg.Chat.Persona = "大肥鱼"
 	return b, &fakePlatform{}
 }
@@ -426,21 +445,57 @@ func TestStickerAutoSaveAndSendTool(t *testing.T) {
 	}
 }
 
-func TestStickerCommand(t *testing.T) {
+func TestEmoRandSendsSticker(t *testing.T) {
 	b, p := newTestBot(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Error("command should not call the model")
 	})
 	st, _ := stickers.NewStore(t.TempDir(), 10)
-	st.Add("image/png", []byte("x"), "[/呲牙]")
+	_, _, _ = st.Add("image/png", []byte("x"), "[/呲牙]")
 	b.stickers = st
 
-	b.handle(p, &core.Message{SessionKey: "qq:g:100", UserID: "1", UserName: "a", Content: "/sticker", ReplyCtx: "c"})
+	b.handle(p, &core.Message{SessionKey: "qq:g:100", UserID: "1", UserName: "a", Content: "/emo rand", ReplyCtx: "c"})
 
 	if _, data := p.sentImage(); string(data) != "x" {
 		t.Errorf("sticker not sent: %q", data)
 	}
 	if got := p.messages(); len(got) != 0 {
 		t.Errorf("unexpected text replies: %#v", got)
+	}
+}
+
+func TestEmoCommand(t *testing.T) {
+	b, p := newTestBot(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("command should not call the model")
+	})
+	st, _ := stickers.NewStore(t.TempDir(), 10)
+	_, _, _ = st.Add("image/png", []byte("first"), "锯楼下唧唧")
+	_, _, _ = st.Add("image/png", []byte("second"), "哦嘿嘿嘿")
+	b.stickers = st
+
+	msg := func(content string) *core.Message {
+		return &core.Message{SessionKey: "qq:g:100", UserID: "1", UserName: "a", Content: content, ReplyCtx: "c"}
+	}
+
+	b.handle(p, msg("/emo"))
+	msgs := p.messages()
+	if len(msgs) != 1 || !strings.Contains(msgs[0], "1. 锯楼下唧唧") || !strings.Contains(msgs[0], "2. 哦嘿嘿嘿") {
+		t.Fatalf("list = %#v", msgs)
+	}
+
+	b.handle(p, msg("/emo 2"))
+	if _, data := p.sentImage(); string(data) != "second" {
+		t.Errorf("by number sent %q, want second", data)
+	}
+
+	b.handle(p, msg("/emo 锯楼"))
+	if _, data := p.sentImage(); string(data) != "first" {
+		t.Errorf("by label sent %q, want first", data)
+	}
+
+	before := len(p.messages())
+	b.handle(p, msg("/emo 不存在"))
+	if got := p.messages(); len(got) != before+1 || !strings.Contains(got[before], "没有这个表情") {
+		t.Errorf("missing-label reply = %#v", got)
 	}
 }
 
@@ -519,5 +574,154 @@ func TestDictatorMoodFollowsModelMarker(t *testing.T) {
 	b.handle(p, msg)
 	if got := b.mood.Current(105370974); got != "不错" {
 		t.Errorf("mood = %q", got)
+	}
+}
+
+func TestWebImagesTool(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<img src="/x.png"><img data-src="https://cdn.example/y.jpg">`))
+	}))
+	defer srv.Close()
+
+	b, p := newTestBot(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("web_images should not call the model")
+	})
+	out := b.runTool(context.Background(),
+		llm.ToolCall{Name: "web_images", Arguments: `{"url":"` + srv.URL + `"}`}, p, nil, "qq:g:1")
+
+	if !strings.Contains(out, srv.URL+"/x.png") || !strings.Contains(out, "https://cdn.example/y.jpg") {
+		t.Errorf("tool output = %q", out)
+	}
+}
+
+func TestSendImageVerifiesContent(t *testing.T) {
+	pngData, err := base64.StdEncoding.DecodeString(
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+	if err != nil {
+		t.Fatal(err)
+	}
+	imgSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Write(pngData)
+	}))
+	defer imgSrv.Close()
+
+	reply := `{"match":false,"desc":"一只猫"}`
+	b, p := newTestBot(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"choices":[{"message":{"content":` + strconv.Quote(reply) + `}}]}`))
+	})
+	out := b.runTool(context.Background(), llm.ToolCall{
+		Name: "send_image", Arguments: `{"url":"` + imgSrv.URL + `","expect":"国科大校园航拍"}`,
+	}, p, nil, "qq:g:1")
+	if !strings.Contains(out, "不符") {
+		t.Errorf("result = %q", out)
+	}
+	if _, data := p.sentImage(); len(data) != 0 {
+		t.Error("mismatched image was sent anyway")
+	}
+
+	// A matching verdict lets it through.
+	b2, p2 := newTestBot(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"choices":[{"message":{"content":"{\"match\":true,\"desc\":\"校园\"}"}}]}`))
+	})
+	out = b2.runTool(context.Background(), llm.ToolCall{
+		Name: "send_image", Arguments: `{"url":"` + imgSrv.URL + `","expect":"国科大校园航拍"}`,
+	}, p2, nil, "qq:g:1")
+	if out != "图片已发送" {
+		t.Errorf("result = %q", out)
+	}
+	if _, data := p2.sentImage(); len(data) == 0 {
+		t.Error("verified image was not sent")
+	}
+}
+
+func TestNeedsAutoLabel(t *testing.T) {
+	for _, label := range []string{"", "  ", "[动画表情]", "[表情]", "[图片]"} {
+		if !needsAutoLabel(label) {
+			t.Errorf("needsAutoLabel(%q) = false, want true", label)
+		}
+	}
+	for _, label := range []string{"[/呲牙]", "狗头大笑"} {
+		if needsAutoLabel(label) {
+			t.Errorf("needsAutoLabel(%q) = true, want false", label)
+		}
+	}
+}
+
+func TestModeSwitchStartsNewSession(t *testing.T) {
+	b, p := newTestBot(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"choices":[{"message":{"content":"好"}}]}`))
+	})
+	msg := func() *core.Message {
+		return &core.Message{SessionKey: "qq:g:100", UserID: "1", UserName: "a", Content: "在吗", ReplyCtx: "c"}
+	}
+
+	b.handle(p, msg())
+	first, err := b.store.Load("qq:g:100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != "s1" || len(first.Messages) != 2 {
+		t.Fatalf("first session = %+v", first)
+	}
+
+	p.modeReset = true
+	b.handle(p, msg())
+	second, err := b.store.Load("qq:g:100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == first.ID || len(second.Messages) != 2 {
+		t.Fatalf("mode switch did not start a fresh session: %+v", second)
+	}
+}
+
+func TestRecentImagesBySource(t *testing.T) {
+	b := &bot{}
+	b.rememberImages("qq:g:1", []core.ImageAttachment{
+		{MimeType: "image/png", Data: []byte("a")},
+		{MimeType: "image/png", Data: []byte("b")},
+	})
+	if ci, ok := b.recentImage("qq:g:1", 1); !ok || string(ci.data) != "b" {
+		t.Fatalf("newest = %q (ok=%v), want b", ci.data, ok)
+	}
+	if ci, ok := b.recentImage("qq:g:1", 2); !ok || string(ci.data) != "a" {
+		t.Fatalf("second = %q (ok=%v), want a", ci.data, ok)
+	}
+	if _, ok := b.recentImage("qq:g:1", 3); ok {
+		t.Error("third oldest should be missing")
+	}
+	if _, ok := b.recentImage("qq:g:2", 1); ok {
+		t.Error("images must not leak across sessions")
+	}
+}
+
+func TestEditImageToolCropsLastImage(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	b, p := newTestBot(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("edit_image without expect should not call the model")
+	})
+	img := image.NewRGBA(image.Rect(0, 0, 40, 20))
+	for x := 0; x < 40; x++ {
+		for y := 0; y < 20; y++ {
+			img.Set(x, y, color.RGBA{R: uint8(x * 6), G: uint8(y * 12), B: 90, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	b.rememberImages("qq:g:1", []core.ImageAttachment{{MimeType: "image/png", Data: buf.Bytes()}})
+
+	out := b.runTool(context.Background(), llm.ToolCall{
+		Name: "edit_image", Arguments: `{"crop":[0.25,0,0.75,1],"scale":2}`,
+	}, p, nil, "qq:g:1")
+	if out != "图片已发送（40x40）" {
+		t.Fatalf("result = %q", out)
+	}
+	if _, data := p.sentImage(); len(data) == 0 {
+		t.Error("edited image was not sent")
 	}
 }

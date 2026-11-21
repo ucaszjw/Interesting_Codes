@@ -153,6 +153,15 @@ type Platform struct {
 	// toggled by /dict and persisted.
 	dictatorMode      atomic.Bool
 	dictatorStatePath string
+	// darkMode is the /dark rule: members who do not swear get muted. Also
+	// persisted, and it stacks with dictator mode.
+	darkMode      atomic.Bool
+	darkStatePath string
+
+	// modeResetPending records groups whose conversation should start fresh after
+	// a behavior-mode switch, so old context is not judged by the new rules.
+	modeMu           sync.Mutex
+	modeResetPending map[int64]bool
 
 	// botGroupRoles caches the bot's own role per group so every message can carry
 	// the right [群管] hint without an API call each time.
@@ -371,6 +380,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		muteMaxMinutes = 10
 	}
 	dictatorMode, _ := opts["dictator_mode"].(bool)
+	darkMode, _ := opts["dark_mode"].(bool)
 
 	emojiLikeDef, _ := opts["emoji_like_id"].(string)
 
@@ -453,17 +463,23 @@ func New(opts map[string]any) (core.Platform, error) {
 		seenNames:             map[int64]string{},
 		moderationGroups:      moderationGroups,
 		muteMaxMinutes:        muteMaxMinutes,
-		dictatorStatePath:     dictatorStatePath(opts),
+		dictatorStatePath:     modeStatePath(opts, "dictator.json"),
+		darkStatePath:         modeStatePath(opts, "dark.json"),
+		modeResetPending:      map[int64]bool{},
 		botGroupRoles:         map[int64]groupRoleEntry{},
 		emojiLikeDef:          emojiLikeDef,
 		cronJobs:              cronJobs,
 		recentMessages:        make(map[int64]*recallEntry),
 	}
-	// A persisted /dict value wins over the config default.
-	if saved, ok := loadDictatorMode(p.dictatorStatePath); ok {
+	// Persisted /dict and /dark values win over the config defaults.
+	if saved, ok := loadModeFlag(p.dictatorStatePath); ok {
 		dictatorMode = saved
 	}
+	if saved, ok := loadModeFlag(p.darkStatePath); ok {
+		darkMode = saved
+	}
 	p.dictatorMode.Store(dictatorMode)
+	p.darkMode.Store(darkMode)
 	return p, nil
 }
 
@@ -737,6 +753,12 @@ func (p *Platform) handleMessage(payload map[string]any) {
 	// directions (otherwise it could never be turned off again).
 	if isCommand(text, "/dict") {
 		p.handleDictCommand(rctx, userID, text)
+		return
+	}
+
+	// /dark is the "swear or get muted" mode. Same admin-only toggle rule.
+	if isCommand(text, "/dark") {
+		p.handleDarkCommand(rctx, userID, text)
 		return
 	}
 
@@ -1545,8 +1567,11 @@ func (p *Platform) moderateMute(rctx *replyContext, a moderationAction) error {
 	// A group owner outranks everyone, so the rank checks only apply when the bot
 	// is merely an admin.
 	botIsOwner := p.botIsGroupOwner(groupID)
-	// The operator is normally never muted; dictator mode removes that exemption.
-	if a.kind == "mute" && !(p.dictatorMode.Load() && botIsOwner) && p.isAdmin(a.target) {
+	// The operator is normally never muted. Dictator mode removes that exemption
+	// when the bot owns the group; dark mode removes it outright — its rule is
+	// "no profanity, no voice", and 张氏 is not exempt.
+	if a.kind == "mute" && !p.darkMode.Load() &&
+		!(p.dictatorMode.Load() && botIsOwner) && p.isAdmin(a.target) {
 		return fmt.Errorf("无法禁言")
 	}
 	// Membership is the hard check: it rejects invented QQ numbers, and it tells us
@@ -2132,17 +2157,42 @@ func (p *Platform) RoleHint(sessionKey string) string {
 	if !ok || !p.moderationGroups[gid] {
 		return ""
 	}
-	switch p.botGroupRole(gid) {
+	role := p.botGroupRole(gid)
+	var hint string
+	switch role {
 	case "owner":
 		if p.dictatorMode.Load() {
-			return "[群管:独裁]"
+			hint = "[群管:独裁]"
+		} else {
+			hint = "[群管:群主]"
 		}
-		return "[群管:群主]"
 	case "admin":
-		return "[群管:管理员]"
+		hint = "[群管:管理员]"
 	default:
-		return "[群管]"
+		hint = "[群管]"
 	}
+	// Dark mode only matters where the bot can actually mute.
+	if p.darkMode.Load() && (role == "owner" || role == "admin") {
+		hint += "[群管:黑暗]"
+	}
+	return hint
+}
+
+// ConsumeModeReset reports whether a behavior mode flipped since this session
+// last ran. The harness starts a new conversation when it returns true, so the
+// model does not interpret old context under the new rules.
+func (p *Platform) ConsumeModeReset(sessionKey string) bool {
+	gid, ok := groupIDFromSessionKey(sessionKey)
+	if !ok {
+		return false
+	}
+	p.modeMu.Lock()
+	defer p.modeMu.Unlock()
+	if p.modeResetPending[gid] {
+		delete(p.modeResetPending, gid)
+		return true
+	}
+	return false
 }
 
 // groupIDFromSessionKey extracts the group id from both session-key shapes:
@@ -2736,10 +2786,10 @@ func (p *Platform) handleDictCommand(rctx *replyContext, userID int64, text stri
 	switch arg {
 	case "on", "true", "1", "开", "开启":
 		p.setDictatorMode(true)
-		reply("独裁模式已开启：群主是 bot 时，张氏也不再享有豁免，任何人的权限指令都不服从。")
+		reply("独裁模式已开启：群主是 bot 时，张氏也不再享有豁免，任何人的权限指令都不服从。已开新会话。")
 	case "off", "false", "0", "关", "关闭":
 		p.setDictatorMode(false)
-		reply("独裁模式已关闭。")
+		reply("独裁模式已关闭。已开新会话。")
 	case "", "status", "状态":
 		state := "关闭"
 		if p.dictatorMode.Load() {
@@ -2751,13 +2801,68 @@ func (p *Platform) handleDictCommand(rctx *replyContext, userID int64, text stri
 	}
 }
 
+// handleDarkCommand implements /dark: members who do not swear get muted.
+func (p *Platform) handleDarkCommand(rctx *replyContext, userID int64, text string) {
+	reply := func(msg string) {
+		if err := p.Reply(context.Background(), rctx, msg); err != nil {
+			slog.Warn("qq: reply to /dark failed", "error", err)
+		}
+	}
+	if !p.isAdmin(userID) {
+		reply("只有张氏能切换黑暗模式。")
+		return
+	}
+	fields := strings.Fields(text)
+	arg := ""
+	if len(fields) > 1 {
+		arg = strings.ToLower(fields[1])
+	}
+	switch arg {
+	case "on", "true", "1", "开", "开启":
+		p.setDarkMode(true)
+		reply("黑暗模式已开启：不说脏话的群友会被禁言。已开新会话。")
+	case "off", "false", "0", "关", "关闭":
+		p.setDarkMode(false)
+		reply("黑暗模式已关闭。已开新会话。")
+	case "", "status", "状态":
+		state := "关闭"
+		if p.darkMode.Load() {
+			state = "开启"
+		}
+		reply("黑暗模式当前：" + state + "。用法：/dark on|off")
+	default:
+		reply("用法：/dark on|off")
+	}
+}
+
 // setDictatorMode updates the flag and persists it so a restart keeps it.
 func (p *Platform) setDictatorMode(enabled bool) {
 	p.dictatorMode.Store(enabled)
-	if err := saveDictatorMode(p.dictatorStatePath, enabled); err != nil {
+	if err := saveModeFlag(p.dictatorStatePath, enabled); err != nil {
 		slog.Warn("qq: save dictator mode failed", "error", err)
 	}
+	p.markModeResetAll()
 	slog.Info("qq: dictator mode changed", "enabled", enabled)
+}
+
+// setDarkMode updates the dark-mode flag and persists it.
+func (p *Platform) setDarkMode(enabled bool) {
+	p.darkMode.Store(enabled)
+	if err := saveModeFlag(p.darkStatePath, enabled); err != nil {
+		slog.Warn("qq: save dark mode failed", "error", err)
+	}
+	p.markModeResetAll()
+	slog.Info("qq: dark mode changed", "enabled", enabled)
+}
+
+// markModeResetAll queues a fresh conversation for every moderated group on
+// their next message.
+func (p *Platform) markModeResetAll() {
+	p.modeMu.Lock()
+	defer p.modeMu.Unlock()
+	for gid := range p.moderationGroups {
+		p.modeResetPending[gid] = true
+	}
 }
 
 func (p *Platform) handleScopeCommand(rctx *replyContext, userID int64, text string) {
@@ -2908,17 +3013,17 @@ func saveChatScope(path, scope string) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
-// dictatorStatePath stores the /dict toggle next to the chat-scope state.
-func dictatorStatePath(opts map[string]any) string {
+// modeStatePath stores a persisted mode toggle next to the chat-scope state.
+func modeStatePath(opts map[string]any, name string) string {
 	dataDir := strings.TrimSpace(toString(opts["cc_data_dir"]))
 	project := strings.TrimSpace(toString(opts["cc_project"]))
 	if dataDir == "" || project == "" {
 		return ""
 	}
-	return filepath.Join(dataDir, "qq", sanitizePathPart(project), "dictator.json")
+	return filepath.Join(dataDir, "qq", sanitizePathPart(project), name)
 }
 
-func loadDictatorMode(path string) (bool, bool) {
+func loadModeFlag(path string) (bool, bool) {
 	if path == "" {
 		return false, false
 	}
@@ -2935,7 +3040,7 @@ func loadDictatorMode(path string) (bool, bool) {
 	return st.Enabled, true
 }
 
-func saveDictatorMode(path string, enabled bool) error {
+func saveModeFlag(path string, enabled bool) error {
 	if path == "" {
 		return nil
 	}

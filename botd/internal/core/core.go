@@ -86,6 +86,13 @@ type ImageSender interface {
 	SendImage(ctx context.Context, replyCtx any, img ImageAttachment) error
 }
 
+// ModeResetter is implemented by platforms that switch in-group behavior modes
+// (such as /dict or /dark). It returns true once per switch so the harness can
+// start a fresh conversation instead of judging old context by the new rules.
+type ModeResetter interface {
+	ConsumeModeReset(sessionKey string) bool
+}
+
 // AudioSender is implemented by platforms that can send voice messages.
 type AudioSender interface {
 	SendAudio(ctx context.Context, replyCtx any, audio []byte, format string) error
@@ -177,8 +184,8 @@ func ConvertAudioToMP3(ctx context.Context, audio []byte, srcFormat string) ([]b
 var builtinCommands = [][]string{
 	{"new"}, {"reset"}, {"persona"}, {"scope"}, {"game"}, {"bots"},
 	{"mute"}, {"unmute"}, {"help"}, {"status"}, {"list", "sessions"},
-	{"switch"}, {"name", "rename"}, {"facts"}, {"remember"}, {"forget"}, {"dict"},
-	{"sticker", "stickers"}, {"tts"}, {"compress", "compact"},
+	{"switch"}, {"name", "rename"}, {"facts"}, {"remember"}, {"forget"}, {"dict"}, {"dark"},
+	{"emo"}, {"tts"}, {"compress", "compact"},
 }
 
 // IsBuiltinCommand reports whether raw names a built-in command.

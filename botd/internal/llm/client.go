@@ -103,7 +103,9 @@ type wireContent struct {
 	ImageURL *wireImgURL `json:"image_url,omitempty"`
 }
 
-type wireImgURL struct{ URL string `json:"url"` }
+type wireImgURL struct {
+	URL string `json:"url"`
+}
 
 type wireToolCall struct {
 	ID       string `json:"id,omitempty"`
@@ -225,6 +227,83 @@ func (c *Client) ChatWithTools(ctx context.Context, system string, msgs []Messag
 		})
 	}
 	return res, nil
+}
+
+const describeSystem = `你是表情包标注器。先看图上有没有明显的文字：
+- 有文字：直接输出图上的文字，太长就概括成关键短语，网感梗保持原样；
+- 没有文字：用 2-6 个中文词描述情绪、动作或画面。
+只输出标签本身，不要解释、不要标点、不要引号。例如：
+狗头大笑
+猫咪流泪
+你礼貌吗
+无语翻白眼`
+
+// DescribeImage returns a short Chinese label for a sticker.
+func (c *Client) DescribeImage(ctx context.Context, mime string, data []byte) (string, error) {
+	resp, err := c.Chat(ctx, describeSystem, []Message{{
+		Role: "user", Content: "给这个表情打个标签", Images: []Image{{MimeType: mime, Data: data}},
+	}})
+	if err != nil {
+		return "", err
+	}
+	label := sanitizeLabel(resp.Content)
+	if label == "" {
+		return "", fmt.Errorf("describe: empty label")
+	}
+	return label, nil
+}
+
+func sanitizeLabel(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, "`\"'“”‘’「」『』（）()[]【】")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	// Drop punctuation and spaces, keep a compact tag.
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case ' ', '\t', '.', ',', '。', '，', '、', '!', '！', '?', '？', ':', '：', ';', '；':
+			continue
+		}
+		b.WriteRune(r)
+	}
+	r := []rune(b.String())
+	if len(r) > 20 {
+		r = r[:20]
+	}
+	return string(r)
+}
+
+const verifySystem = `你是图片核对器。用户会给一张图片和一句期望内容，判断图片是否真的展示了该内容。
+只输出一个 JSON 对象，不要 Markdown、不要解释：
+{"match": true 或 false, "desc": "用不超过 20 个字描述图片实际内容"}`
+
+// VerifyImage checks whether the image matches the expectation.
+func (c *Client) VerifyImage(ctx context.Context, mime string, data []byte, expect string) (bool, string, error) {
+	expect = strings.TrimSpace(expect)
+	if expect == "" {
+		return true, "", nil
+	}
+	prompt := fmt.Sprintf("这张图应该展示：%s\n请判断图片内容是否相符。", expect)
+	resp, err := c.Chat(ctx, verifySystem, []Message{{
+		Role: "user", Content: prompt, Images: []Image{{MimeType: mime, Data: data}},
+	}})
+	if err != nil {
+		return false, "", err
+	}
+	body := resp.Content
+	// Tolerate code fences or stray prose around the JSON object.
+	if i, j := strings.Index(body, "{"), strings.LastIndex(body, "}"); i >= 0 && j > i {
+		body = body[i : j+1]
+	}
+	var out struct {
+		Match bool   `json:"match"`
+		Desc  string `json:"desc"`
+	}
+	if err := json.Unmarshal([]byte(body), &out); err != nil {
+		return false, "", fmt.Errorf("verify: decode reply: %w", err)
+	}
+	return out.Match, out.Desc, nil
 }
 
 const summarizerSystem = `你是一个群聊记录压缩器。把用户给出的旧记录合并进已有摘要，输出一段不超过字数限制的摘要。

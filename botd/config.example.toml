@@ -16,6 +16,10 @@ moderation_mute_max_minutes = 10
 # bot's own judgment matters.
 # 独裁模式：bot 为群主时取消所有豁免——张氏也能被禁言/撤销管理，任何人的指令都不服从。
 dictator_mode = false
+# dark_mode: while on, group members who don't swear in a message get muted by
+# the bot for 1-2 minutes. Toggle in-group with /dark on|off.
+# 黑暗模式：开启后，不说脏话的群友会被禁言；群内用 /dark on|off 切换。
+dark_mode = false
 voice_probability = 10
 reply_cooldown = 60
 reply_probability = 10
@@ -45,13 +49,14 @@ api_key = ""            # default: llm.api_key
 enabled = true
 dir = "./data/stickers"   # memes seen in group chats are saved here
 max = 300                 # oldest files are evicted beyond this
+auto_label = true         # let the vision model tag animated stickers it can't name
 
 [chat]
 persona = "大肥鱼"
 prompts_dir = "./prompts"
 sessions_dir = "./data/sessions"
-history_max_tokens = 16000
-keep_recent_messages = 24
+history_max_tokens = 12000
+keep_recent_messages = 16
 summary_max_chars = 500
 
 # Scheduled jobs. "prompt" goes through the model; "message" is sent literally
